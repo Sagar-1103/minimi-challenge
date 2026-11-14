@@ -1,0 +1,63 @@
+# Environment & local secrets
+.env
+.env.local
+.env.*.local
+*.env
+
+# Dependencies & package caches
+node_modules/
+.pnp/
+.pnp.js
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Build artifacts & distribution
+dist/
+build/
+out/
+.next/
+.turbo/
+*.egg-info/
+*.egg
+target/
+
+# Logs & debugging
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Testing & coverage
+coverage/
+.nyc_output/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# OS metadata & temporary files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.tmp/
+tmp/
+
+# IDE & Editor configs
+.idea/
+*.sublime-project
+*.sublime-workspace
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/launch.json
+
+/docs
