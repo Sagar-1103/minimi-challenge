@@ -1,19 +1,20 @@
-import express, { Request, Response } from "express";
+import express from "express";
 import cors from "cors";
+import appRouter from "./routes";
+import { errorHandler } from "./middlewares/errorHandler";
 
 const app = express();
 
-app.use(cors({
+app.use(
+  cors({
     origin: "*",
-}));
+  })
+);
 
 app.use(express.json());
 
-app.get('/health', (req: Request, res: Response) => {
-  return res.status(200).json({
-    status: 'ok',
-    timestamp: new Date().toISOString()
-  });
-});
+app.use("/api", appRouter);
+
+app.use(errorHandler);
 
 export default app;
