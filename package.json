@@ -11,7 +11,15 @@
     "dev:be": "npm run dev:backend",
     "install:backend": "npm install --prefix backend",
     "install:frontend": "npm install --prefix frontend",
-    "install:all": "npm install && npm run install:backend"
+    "install:all": "npm install && npm run install:backend",
+    "db:up": "docker compose up -d postgres",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f postgres",
+    "db:reset": "docker compose down -v && docker compose up -d postgres",
+    "prisma:generate": "npm run prisma:generate --prefix backend",
+    "prisma:migrate": "npm run prisma:migrate --prefix backend",
+    "prisma:push": "npm run prisma:push --prefix backend",
+    "prisma:studio": "npm run prisma:studio --prefix backend"
   },
   "devDependencies": {
     "concurrently": "^10.0.7",

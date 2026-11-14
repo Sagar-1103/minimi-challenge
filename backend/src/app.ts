@@ -10,7 +10,10 @@ app.use(cors({
 app.use(express.json());
 
 app.get('/health', (req: Request, res: Response) => {
-  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+  return res.status(200).json({
+    status: 'ok',
+    timestamp: new Date().toISOString()
+  });
 });
 
 export default app;
