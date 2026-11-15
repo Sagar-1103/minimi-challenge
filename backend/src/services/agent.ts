@@ -12,6 +12,9 @@ import { logger } from "../utils/logger";
 import { conversationService } from "./conversation.service";
 import { messageService } from "./message.service";
 import { formatHistoryForLLM, formatTimestamp } from "./history.formatter";
+import { DateResolver } from "./date-resolver";
+import { determineAnchorDate } from "./anchor-date";
+import { QueryBuilder } from "./query-builder";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
 import type { ToolCallRecordInput } from "../types/conversation.types";
@@ -21,7 +24,7 @@ const webSearchTool: ChatCompletionTool = {
   function: {
     name: "web_search",
     description:
-      "Search the web for current, up-to-date, or time-sensitive information such as pricing, recent releases, news, and changes. Use specific, short queries (3-8 words). One entity per query.",
+      "Search the web for current, up-to-date, or time-sensitive information, recent events, or verifiable facts. Use specific, short queries (3-8 words). One entity or topic per query.",
     parameters: {
       type: "object",
       properties: {
@@ -120,14 +123,16 @@ export async function runAgent(
 
   let conversationId = options.conversationId;
   let priorHistory: ChatCompletionMessageParam[] = [];
+  let rawHistory: Array<{ role: string; content: string | null; createdAt?: Date | string }> = [];
 
-  // 1. Persistence & History Loading
+  // Load existing conversation or initialize a new one
   if (shouldPersist) {
     if (conversationId) {
       const existingConv = await conversationService.getById(conversationId);
       if (!existingConv) {
         throw new NotFoundError(`Conversation with ID "${conversationId}" not found`);
       }
+      rawHistory = existingConv.messages;
       priorHistory = formatHistoryForLLM(existingConv.messages);
       await messageService.addUserMessage(conversationId, userMessage);
     } else {
@@ -137,6 +142,18 @@ export async function runAgent(
     }
   } else if (options.history) {
     priorHistory = options.history;
+  }
+
+  // Ground temporal context (resolve anchor dates and relative timeframes)
+  const referenceDate = new Date();
+  const dateResolver = new DateResolver(referenceDate);
+  const anchorContext = determineAnchorDate(userMessage, rawHistory, dateResolver);
+  const queryBuilder = new QueryBuilder(referenceDate, anchorContext?.anchorDate);
+
+  if (anchorContext) {
+    logger.info(
+      `Temporal Anchor identified: ${dateResolver.formatForDisplay(anchorContext.anchorDate)} (${anchorContext.daysBetween}d ago via ${anchorContext.source})`
+    );
   }
 
   const steps: AgentStep[] = [];
@@ -154,10 +171,17 @@ export async function runAgent(
     }
   };
 
-  const currentFormattedUserMessage = `${formatTimestamp(new Date())} ${userMessage}`;
+  const currentFormattedUserMessage = `${formatTimestamp(referenceDate)} ${userMessage}`;
 
   const messages: ChatCompletionMessageParam[] = [
-    { role: "system", content: buildSystemPrompt() },
+    {
+      role: "system",
+      content: buildSystemPrompt({
+        referenceDate,
+        timezone: "UTC",
+        anchorDate: anchorContext,
+      }),
+    },
     ...priorHistory,
     { role: "user", content: currentFormattedUserMessage },
   ];
@@ -216,7 +240,7 @@ export async function runAgent(
       logger.agent(
         iteration,
         `Executing ${toolCallsList.length} tool call(s) in parallel`,
-        toolCallsList.map((tc) => tc.arguments.query)
+        toolCallsList.map((tc) => queryBuilder.enrichQuery(tc.arguments.query || ""))
       );
 
       // Execute all tool calls in parallel using Promise.allSettled
@@ -246,7 +270,8 @@ export async function runAgent(
           };
         }
 
-        const query = parseResult.data.query;
+        const rawQuery = parseResult.data.query;
+        const query = queryBuilder.enrichQuery(rawQuery);
         try {
           const searchRes = await searchWeb({ query });
           const duration = Date.now() - startTime;
