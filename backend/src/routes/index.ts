@@ -1,5 +1,6 @@
 import { Request, Response, Router } from "express";
 import chatRouter from "./chat.routes";
+import conversationRouter from "./conversation.routes";
 
 const appRouter = Router();
 
@@ -13,5 +14,8 @@ appRouter.get("/health", (_req: Request, res: Response) => {
 
 // chat routes -> POST /api/chat
 appRouter.use("/chat", chatRouter);
+
+// conversation routes -> /api/conversations
+appRouter.use("/conversations", conversationRouter);
 
 export default appRouter;

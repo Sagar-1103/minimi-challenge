@@ -6,3 +6,59 @@ generator client {
 datasource db {
   provider = "postgresql"
 }
+
+model Conversation {
+  id        String    @id @default(cuid())
+  title     String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  messages  Message[]
+
+  @@map("conversations")
+}
+
+model Message {
+  id             String           @id @default(cuid())
+  conversationId String
+  conversation   Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role           MessageRole
+  content        String?
+  timestamp      DateTime         @default(now())
+  toolCalls      ToolCallRecord[]
+  toolCallId     String?
+  model          String?
+  tokenCount     Int?
+  createdAt      DateTime         @default(now())
+
+  @@index([conversationId, timestamp])
+  @@index([conversationId, role])
+  @@map("messages")
+}
+
+model ToolCallRecord {
+  id        String         @id @default(cuid())
+  messageId String
+  message   Message        @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  toolName  String
+  query     String
+  result    String?
+  status    ToolCallStatus @default(SUCCESS)
+  duration  Int?
+  createdAt DateTime       @default(now())
+
+  @@index([messageId])
+  @@map("tool_call_records")
+}
+
+enum MessageRole {
+  user
+  assistant
+  system
+  tool
+}
+
+enum ToolCallStatus {
+  SUCCESS
+  FAILED
+  TIMEOUT
+}

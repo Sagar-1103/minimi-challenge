@@ -7,10 +7,14 @@ import { llm, getActiveModel } from "../lib/llm";
 import { searchWeb, type TavilySearchResponse, type TavilySearchResult } from "../lib/tavily";
 import { buildSystemPrompt } from "../prompts/system";
 import { webSearchArgsSchema } from "../schemas/search.schema";
-import { LLMError } from "../middlewares/errorHandler";
+import { LLMError, NotFoundError } from "../middlewares/errorHandler";
 import { logger } from "../utils/logger";
+import { conversationService } from "./conversation.service";
+import { messageService } from "./message.service";
+import { formatHistoryForLLM, formatTimestamp } from "./history.formatter";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
+import type { ToolCallRecordInput } from "../types/conversation.types";
 
 const webSearchTool: ChatCompletionTool = {
   type: "function",
@@ -37,6 +41,7 @@ export interface RunAgentOptions {
   history?: ChatCompletionMessageParam[];
   maxIterations?: number;
   temperature?: number;
+  persist?: boolean;
 }
 
 export interface AgentRunResult {
@@ -111,10 +116,32 @@ export async function runAgent(
   const maxIterations = options.maxIterations ?? 12;
   const temperature = options.temperature ?? 0.1;
   const activeModel = getActiveModel();
-  const messageId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  const shouldPersist = options.persist ?? true;
+
+  let conversationId = options.conversationId;
+  let priorHistory: ChatCompletionMessageParam[] = [];
+
+  // 1. Persistence & History Loading
+  if (shouldPersist) {
+    if (conversationId) {
+      const existingConv = await conversationService.getById(conversationId);
+      if (!existingConv) {
+        throw new NotFoundError(`Conversation with ID "${conversationId}" not found`);
+      }
+      priorHistory = formatHistoryForLLM(existingConv.messages);
+      await messageService.addUserMessage(conversationId, userMessage);
+    } else {
+      const newConv = await conversationService.create(userMessage);
+      conversationId = newConv.id;
+      await messageService.addUserMessage(conversationId, userMessage);
+    }
+  } else if (options.history) {
+    priorHistory = options.history;
+  }
 
   const steps: AgentStep[] = [];
   const sourcesMap = new Map<string, SourceCitation>();
+  const executedToolCalls: ToolCallRecordInput[] = [];
 
   const addSource = (r: TavilySearchResult) => {
     if (r.url && !sourcesMap.has(r.url)) {
@@ -127,10 +154,12 @@ export async function runAgent(
     }
   };
 
+  const currentFormattedUserMessage = `${formatTimestamp(new Date())} ${userMessage}`;
+
   const messages: ChatCompletionMessageParam[] = [
     { role: "system", content: buildSystemPrompt() },
-    ...(options.history || []),
-    { role: "user", content: userMessage },
+    ...priorHistory,
+    { role: "user", content: currentFormattedUserMessage },
   ];
 
   let iteration = 0;
@@ -141,6 +170,7 @@ export async function runAgent(
     logger.agent(iteration, "Sending request to LLM", {
       model: activeModel,
       messageCount: messages.length,
+      conversationId,
     });
 
     const llmResponse = await callLLMWithRetry({
@@ -181,7 +211,6 @@ export async function runAgent(
         timestamp: new Date().toISOString(),
       });
 
-      // Append assistant message with tool calls to context
       messages.push(message);
 
       logger.agent(
@@ -192,10 +221,21 @@ export async function runAgent(
 
       // Execute all tool calls in parallel using Promise.allSettled
       const executionPromises = toolCallsList.map(async (tc) => {
+        const startTime = Date.now();
         const parseResult = webSearchArgsSchema.safeParse(tc.arguments);
+
         if (!parseResult.success) {
           const errorMsg = `Invalid search arguments: ${parseResult.error.issues.map((i) => i.message).join(", ")}`;
           logger.warn(`Tool call ${tc.id} failed validation: ${errorMsg}`);
+          const duration = Date.now() - startTime;
+          executedToolCalls.push({
+            toolName: tc.name,
+            query: typeof tc.arguments?.query === "string" ? tc.arguments.query : "",
+            result: JSON.stringify({ error: errorMsg }),
+            status: "FAILED",
+            duration,
+          });
+
           return {
             toolCallId: tc.id,
             name: tc.name,
@@ -209,16 +249,37 @@ export async function runAgent(
         const query = parseResult.data.query;
         try {
           const searchRes = await searchWeb({ query });
+          const duration = Date.now() - startTime;
+
           for (const item of searchRes.results) {
             addSource(item);
           }
+
+          const formattedResult = formatSearchResultForLLM(searchRes);
+          executedToolCalls.push({
+            toolName: tc.name,
+            query,
+            result: formattedResult.slice(0, 1500),
+            status: "SUCCESS",
+            duration,
+          });
+
           return {
             toolCallId: tc.id,
             name: tc.name,
-            result: formatSearchResultForLLM(searchRes),
+            result: formattedResult,
           };
         } catch (err: any) {
+          const duration = Date.now() - startTime;
           logger.error(`Search failed for query "${query}": ${err.message}`);
+          executedToolCalls.push({
+            toolName: tc.name,
+            query,
+            result: JSON.stringify({ error: err.message }),
+            status: "FAILED",
+            duration,
+          });
+
           return {
             toolCallId: tc.id,
             name: tc.name,
@@ -292,10 +353,21 @@ export async function runAgent(
           timestamp: new Date().toISOString(),
         });
 
+        let savedMessageId = `msg_${Date.now()}`;
+        if (shouldPersist && conversationId) {
+          const savedMsg = await messageService.addAssistantMessage(
+            conversationId,
+            finalContent,
+            executedToolCalls,
+            activeModel
+          );
+          savedMessageId = savedMsg.id;
+        }
+
         return {
           answer: finalContent,
-          conversationId: options.conversationId,
-          messageId,
+          conversationId,
+          messageId: savedMessageId,
           sources: Array.from(sourcesMap.values()),
           steps,
         };
@@ -316,20 +388,43 @@ export async function runAgent(
       timestamp: new Date().toISOString(),
     });
 
+    let savedMessageId = `msg_${Date.now()}`;
+    if (shouldPersist && conversationId) {
+      const savedMsg = await messageService.addAssistantMessage(
+        conversationId,
+        finalAnswer,
+        executedToolCalls,
+        activeModel
+      );
+      savedMessageId = savedMsg.id;
+    }
+
     return {
       answer: finalAnswer,
-      conversationId: options.conversationId,
-      messageId,
+      conversationId,
+      messageId: savedMessageId,
       sources: Array.from(sourcesMap.values()),
       steps,
     };
   }
 
   // Fallback if loop exits without returning
+  const fallbackAnswer = "I could not complete the request within the allowed steps.";
+  let savedMessageId = `msg_${Date.now()}`;
+  if (shouldPersist && conversationId) {
+    const savedMsg = await messageService.addAssistantMessage(
+      conversationId,
+      fallbackAnswer,
+      executedToolCalls,
+      activeModel
+    );
+    savedMessageId = savedMsg.id;
+  }
+
   return {
-    answer: "I could not complete the request within the allowed steps.",
-    conversationId: options.conversationId,
-    messageId,
+    answer: fallbackAnswer,
+    conversationId,
+    messageId: savedMessageId,
     sources: Array.from(sourcesMap.values()),
     steps,
   };
