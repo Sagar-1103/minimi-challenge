@@ -14,7 +14,7 @@ export async function streamChat(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const { message, conversationId } = parseResult.data;
+  const { message, conversationId, timezone, userDate } = parseResult.data;
 
   // Set SSE streaming headers
   res.setHeader("Content-Type", "text/event-stream");
@@ -24,9 +24,11 @@ export async function streamChat(req: Request, res: Response): Promise<void> {
 
   const abortController = new AbortController();
 
-  req.on("close", () => {
-    logger.info("Client connection closed; aborting active agent stream");
-    abortController.abort();
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      logger.info("Client connection closed; aborting active agent stream");
+      abortController.abort();
+    }
   });
 
   const emitter = new AgentEventEmitter();
@@ -71,13 +73,20 @@ export async function streamChat(req: Request, res: Response): Promise<void> {
   try {
     await runAgentStreaming(
       message,
-      { conversationId },
+      {
+        conversationId,
+        timezone,
+        referenceDate: userDate ? new Date(userDate) : undefined,
+      },
       emitter,
       abortController.signal
     );
   } catch (err: any) {
     logger.error(`Streaming agent execution error: ${err.message}`);
     emitter.emitError(err.message, "STREAM_EXECUTION_ERROR");
-    res.end();
+  } finally {
+    if (!res.writableEnded) {
+      res.end();
+    }
   }
 }

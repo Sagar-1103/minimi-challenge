@@ -67,6 +67,8 @@ export interface RunAgentOptions {
   maxIterations?: number;
   temperature?: number;
   persist?: boolean;
+  referenceDate?: Date;
+  timezone?: string;
 }
 
 export interface AgentRunResult {
@@ -152,7 +154,8 @@ export async function runAgent(
   }
 
   // Ground temporal context (resolve anchor dates and relative timeframes)
-  const referenceDate = new Date();
+  const referenceDate = options.referenceDate ?? new Date();
+  const timezone = options.timezone ?? "UTC";
   const dateResolver = new DateResolver(referenceDate);
   const anchorContext = determineAnchorDate(userMessage, rawHistory, dateResolver);
   const queryBuilder = new QueryBuilder(referenceDate, anchorContext?.anchorDate);
@@ -376,7 +379,7 @@ export async function runAgent(
       role: "system",
       content: buildSystemPrompt({
         referenceDate,
-        timezone: "UTC",
+        timezone,
         anchorDate: anchorContext,
         answerDirective,
       }),
@@ -549,7 +552,18 @@ export async function runAgent(
         }
       }
 
-      // Append tool responses to messages
+      // Ensure EVERY tool_call from the assistant message has a matching tool response message
+      const pushedToolIds = new Set(toolResults.map((tr) => tr.toolCallId));
+      for (const tc of toolCallsList) {
+        if (!pushedToolIds.has(tc.id)) {
+          toolResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            result: JSON.stringify({ error: "Tool execution produced no output", results: [] }),
+          });
+        }
+      }
+
       for (const tr of toolResults) {
         messages.push({
           role: "tool",
@@ -741,7 +755,8 @@ export async function runAgentStreaming(
     priorHistory = options.history;
   }
 
-  const referenceDate = new Date();
+  const referenceDate = options.referenceDate ?? new Date();
+  const timezone = options.timezone ?? "UTC";
   const dateResolver = new DateResolver(referenceDate);
   const anchorContext = determineAnchorDate(userMessage, rawHistory, dateResolver);
   const queryBuilder = new QueryBuilder(referenceDate, anchorContext?.anchorDate);
@@ -941,7 +956,7 @@ export async function runAgentStreaming(
       role: "system",
       content: buildSystemPrompt({
         referenceDate,
-        timezone: "UTC",
+        timezone,
         anchorDate: anchorContext,
         answerDirective,
       }),
@@ -1077,6 +1092,18 @@ export async function runAgentStreaming(
 
             emitter.emitToolEnd("web_search", vq.query, execRes.results.length, execRes.duration);
           }
+        }
+      }
+
+      // Ensure EVERY tool_call from the assistant message has a matching tool response message
+      const pushedStreamingToolIds = new Set(toolResults.map((tr) => tr.toolCallId));
+      for (const tc of toolCallsList) {
+        if (!pushedStreamingToolIds.has(tc.id)) {
+          toolResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            result: JSON.stringify({ error: "Tool execution produced no output", results: [] }),
+          });
         }
       }
 

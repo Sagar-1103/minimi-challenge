@@ -43,11 +43,31 @@ export function formatHistoryForLLM(
           },
         }));
 
-        result.push({
-          role: "assistant",
-          content: msg.content ? `${timestamp} ${msg.content}` : null,
-          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-        });
+        if (toolCalls.length > 0) {
+          result.push({
+            role: "assistant",
+            content: null,
+            tool_calls: toolCalls,
+          });
+          for (const tc of msg.toolCalls || []) {
+            result.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: tc.result || "{}",
+            });
+          }
+          if (msg.content) {
+            result.push({
+              role: "assistant",
+              content: `${timestamp} ${msg.content}`,
+            });
+          }
+        } else {
+          result.push({
+            role: "assistant",
+            content: msg.content ? `${timestamp} ${msg.content}` : null,
+          });
+        }
         break;
       }
 

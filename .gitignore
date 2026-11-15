@@ -61,3 +61,5 @@ tmp/
 !.vscode/launch.json
 
 /docs
+/skills-lock.json
+/.agents

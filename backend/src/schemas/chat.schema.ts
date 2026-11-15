@@ -10,6 +10,8 @@ export const chatRequestSchema = z.object({
     .trim()
     .min(1, "Conversation ID cannot be empty")
     .optional(),
+  timezone: z.string().optional(),
+  userDate: z.string().optional(),
 });
 
 export type ChatRequestInput = z.infer<typeof chatRequestSchema>;
