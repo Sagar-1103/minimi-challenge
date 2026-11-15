@@ -36,6 +36,7 @@ import {
   errorRecovery,
   contentFilter,
 } from "./safety";
+import { AgentEventEmitter } from "./agent-emitter";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
 import type { ToolCallRecordInput } from "../types/conversation.types";
@@ -698,4 +699,466 @@ export async function runAgent(
     entitiesCovered: [],
     entitiesMissed: answerContext.entities,
   };
+}
+
+export async function runAgentStreaming(
+  userMessage: string,
+  options: RunAgentOptions = {},
+  emitter: AgentEventEmitter,
+  abortSignal?: AbortSignal
+): Promise<void> {
+  const maxIterations = options.maxIterations ?? 12;
+  const temperature = options.temperature ?? 0.1;
+  const activeModel = getActiveModel();
+  const shouldPersist = options.persist ?? true;
+
+  let conversationId = options.conversationId;
+  let currentUserMessageId: string | undefined;
+  let priorHistory: ChatCompletionMessageParam[] = [];
+  let rawHistory: Array<{ role: string; content: string | null; createdAt?: Date | string }> = [];
+
+  emitter.emitStatus("Initializing conversation session...");
+
+  if (abortSignal?.aborted) return;
+
+  if (shouldPersist) {
+    if (conversationId) {
+      const existingConv = await conversationService.getById(conversationId);
+      if (!existingConv) {
+        throw new NotFoundError(`Conversation with ID "${conversationId}" not found`);
+      }
+      rawHistory = existingConv.messages;
+      priorHistory = formatHistoryForLLM(existingConv.messages);
+      const addedMsg = await messageService.addUserMessage(conversationId, userMessage);
+      currentUserMessageId = addedMsg.id;
+    } else {
+      const newConv = await conversationService.create(userMessage);
+      conversationId = newConv.id;
+      const addedMsg = await messageService.addUserMessage(conversationId, userMessage);
+      currentUserMessageId = addedMsg.id;
+    }
+  } else if (options.history) {
+    priorHistory = options.history;
+  }
+
+  const referenceDate = new Date();
+  const dateResolver = new DateResolver(referenceDate);
+  const anchorContext = determineAnchorDate(userMessage, rawHistory, dateResolver);
+  const queryBuilder = new QueryBuilder(referenceDate, anchorContext?.anchorDate);
+  const searchExecutor = new SearchExecutor({
+    maxConcurrency: 5,
+    timeoutMs: 12000,
+    maxTotalSearches: 20,
+  });
+
+  const processedSearchResultsByEntity = new Map<string, ProcessedSearchResult[]>();
+  const sourcesMap = new Map<string, SourceCitation>();
+  const executedToolCalls: ToolCallRecordInput[] = [];
+
+  const addSource = (r: TavilySearchResult) => {
+    if (r.url && !sourcesMap.has(r.url)) {
+      sourcesMap.set(r.url, {
+        title: r.title || r.url,
+        url: r.url,
+        domain: extractDomain(r.url),
+        date: r.publishedDate,
+      });
+    }
+  };
+
+  emitter.emitStatus("Analyzing question & context...");
+
+  // Check for past conversation recall or re-verification intent
+  const reference = ambiguityHandler.detectReference(userMessage, dateResolver);
+  let recalledHistoryPrompt = "";
+
+  if (reference) {
+    if (reference.type === "implicit_followup") {
+      const lastAssistantTurn = rawHistory
+        .slice()
+        .reverse()
+        .find((m) => m.role === "assistant" && m.content);
+
+      if (lastAssistantTurn && lastAssistantTurn.content) {
+        emitter.emitStatus("Verifying claims from previous answer...");
+        const report = await reVerifier.verify(
+          conversationId || "",
+          undefined,
+          undefined,
+          dateResolver,
+          currentUserMessageId
+        );
+        if (report) {
+          recalledHistoryPrompt = reVerifier.formatReportForLLM(report);
+        }
+      }
+    } else {
+      let matches: HistoryMatch[] = [];
+      if (reference.type === "date_and_topic") {
+        matches = await historyRetriever.findByDateAndTopic(
+          conversationId || "",
+          reference.dateExpression,
+          reference.topic,
+          dateResolver,
+          currentUserMessageId
+        );
+      } else if (reference.type === "date_only") {
+        matches = await historyRetriever.findByDate(
+          conversationId || "",
+          reference.dateExpression,
+          dateResolver,
+          currentUserMessageId
+        );
+      } else if (reference.type === "topic_only") {
+        matches = await historyRetriever.findByTopic(
+          conversationId || "",
+          reference.topic,
+          currentUserMessageId
+        );
+      }
+
+      if (matches.length === 0) {
+        matches = await historyRetriever.findAcrossConversations(
+          reference.type !== "topic_only" ? reference.dateExpression : undefined,
+          reference.type !== "date_only" ? reference.topic : undefined,
+          dateResolver,
+          currentUserMessageId
+        );
+      }
+
+      if (matches.length === 0) {
+        const targetDesc =
+          reference.type === "date_only"
+            ? reference.dateExpression
+            : reference.type === "topic_only"
+            ? reference.topic
+            : `${reference.dateExpression} regarding ${reference.topic}`;
+
+        const notFoundAnswer = `I checked our conversation history, but I couldn't find any recorded questions or discussions matching "${targetDesc}".`;
+
+        emitter.emitAnswerStart();
+        emitter.emitAnswerChunk(notFoundAnswer);
+        emitter.emitAnswerEnd(notFoundAnswer);
+
+        let savedMessageId = `msg_${Date.now()}`;
+        if (shouldPersist && conversationId) {
+          const savedMsg = await messageService.addAssistantMessage(
+            conversationId,
+            notFoundAnswer,
+            [],
+            activeModel
+          );
+          savedMessageId = savedMsg.id;
+        }
+
+        emitter.emitDone(conversationId, savedMessageId);
+        return;
+      }
+
+      if (matches.length > 1 && reference.type === "date_only") {
+        const disambiguationAnswer = ambiguityHandler.formatDisambiguation(matches);
+
+        emitter.emitAnswerStart();
+        emitter.emitAnswerChunk(disambiguationAnswer);
+        emitter.emitAnswerEnd(disambiguationAnswer);
+
+        let savedMessageId = `msg_${Date.now()}`;
+        if (shouldPersist && conversationId) {
+          const savedMsg = await messageService.addAssistantMessage(
+            conversationId,
+            disambiguationAnswer,
+            [],
+            activeModel
+          );
+          savedMessageId = savedMsg.id;
+        }
+
+        emitter.emitDone(conversationId, savedMessageId);
+        return;
+      }
+
+      const matchedTurn = matches[0];
+      const exchange = await historyRetriever.getFullExchange(matchedTurn.message.id);
+
+      if (exchange) {
+        const asksReverify = /\b(still\s+correct|accurate|changed|current|update|valid|prices?)\b/i.test(
+          userMessage
+        );
+
+        let reverifyBlock = "";
+        if (asksReverify) {
+          emitter.emitStatus("Re-verifying claims against current web sources...");
+          const report = await reVerifier.verify(
+            exchange.userMessage.conversationId,
+            reference.type !== "topic_only" ? reference.dateExpression : undefined,
+            reference.type !== "date_only" ? reference.topic : undefined,
+            dateResolver,
+            currentUserMessageId
+          );
+          if (report) {
+            reverifyBlock = `\n\n${reVerifier.formatReportForLLM(report)}`;
+          }
+        }
+
+        recalledHistoryPrompt = [
+          "### Recalled Historical Conversation",
+          `- **Date**: ${dateResolver.formatForDisplay(exchange.timestamp)}`,
+          `- **User Question**: "${exchange.userMessage.content}"`,
+          `- **Assistant Answer**: "${exchange.assistantResponse.content}"`,
+          reverifyBlock,
+          "",
+          "Ground your answer strictly in this recalled exchange. Restate the question and answer clearly. If re-verification details are provided, indicate whether the old facts remain accurate or have changed.",
+        ].join("\n");
+      }
+    }
+  }
+
+  const isReverify =
+    !!reference &&
+    (reference.type === "implicit_followup" ||
+      /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage));
+  const questionType = answerBuilder.detectQuestionType(
+    userMessage,
+    !!anchorContext,
+    isReverify
+  );
+  const entities = answerBuilder.extractEntities(userMessage);
+
+  const answerContext: AnswerContext = {
+    userQuestion: userMessage,
+    questionType,
+    searchResults: processedSearchResultsByEntity,
+    entities,
+    anchorDate: anchorContext?.anchorDate,
+    todayDate: referenceDate,
+  };
+
+  const answerDirective = answerBuilder.buildAnswerPrompt(answerContext);
+  const currentFormattedUserMessage = `${formatTimestamp(referenceDate)} ${userMessage}`;
+
+  let messages: ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: buildSystemPrompt({
+        referenceDate,
+        timezone: "UTC",
+        anchorDate: anchorContext,
+        answerDirective,
+      }),
+    },
+    ...priorHistory,
+    ...(recalledHistoryPrompt
+      ? [
+          {
+            role: "system" as const,
+            content: recalledHistoryPrompt,
+          },
+        ]
+      : []),
+    { role: "user", content: currentFormattedUserMessage },
+  ];
+
+  messages = historyManager.trimHistory(messages, 4000);
+
+  const agentStartTime = Date.now();
+  const loopBreaker = new LoopBreaker({
+    maxIterations,
+    maxToolCalls: 20,
+    maxDuplicateQueries: 2,
+  });
+
+  while (loopBreaker.shouldContinue().continue && !timeoutHandler.isExpired(agentStartTime)) {
+    if (abortSignal?.aborted) return;
+
+    loopBreaker.recordIteration();
+
+    emitter.emitStatus("Planning actions...");
+
+    const llmResponse = await callLLMWithRetry({
+      model: activeModel,
+      messages,
+      tools: [webSearchTool],
+      tool_choice: "auto",
+      temperature,
+    });
+
+    const choice = llmResponse.choices[0];
+    const message = choice.message as ChatCompletionMessage;
+
+    if (message.tool_calls && message.tool_calls.length > 0) {
+      const toolCallsList: ToolCall[] = message.tool_calls.map((tc: any) => {
+        let args: Record<string, any> = {};
+        try {
+          args = JSON.parse(tc.function.arguments);
+        } catch {
+          args = { query: tc.function.arguments };
+        }
+        return {
+          id: tc.id,
+          name: tc.function.name,
+          arguments: args,
+        };
+      });
+
+      messages.push(message);
+
+      const validSearchQueries: Array<{ id: string; query: string }> = [];
+      const toolResults: ToolResult[] = [];
+
+      for (let i = 0; i < toolCallsList.length; i++) {
+        const tc = toolCallsList[i];
+        const parseResult = webSearchArgsSchema.safeParse(tc.arguments);
+
+        if (!parseResult.success) {
+          const errorMsg = `Invalid search arguments: ${parseResult.error.issues.map((i) => i.message).join(", ")}`;
+          executedToolCalls.push({
+            toolName: tc.name,
+            query: typeof tc.arguments?.query === "string" ? tc.arguments.query : "",
+            result: JSON.stringify({ error: errorMsg }),
+            status: "FAILED",
+            duration: 0,
+          });
+          toolResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            result: JSON.stringify({ error: errorMsg, results: [] }),
+          });
+        } else {
+          const rawQuery = parseResult.data.query;
+
+          if (loopBreaker.isDuplicateQuery(rawQuery)) {
+            const skipMsg = `Search skipped: duplicate query "${rawQuery}" was already executed.`;
+            toolResults.push({
+              toolCallId: tc.id,
+              name: tc.name,
+              result: skipMsg,
+            });
+            continue;
+          }
+
+          const query = queryBuilder.enrichQuery(rawQuery);
+          validSearchQueries.push({ id: tc.id, query });
+          emitter.emitToolStart("web_search", query, i);
+        }
+      }
+
+      loopBreaker.recordToolCalls(toolCallsList);
+
+      if (validSearchQueries.length > 0) {
+        emitter.emitStatus(`Searching web for ${validSearchQueries.length} topic(s)...`);
+        const batchResults = await searchExecutor.executeParallel(
+          validSearchQueries,
+          anchorContext?.anchorDate
+        );
+
+        for (const vq of validSearchQueries) {
+          const execRes = batchResults.get(vq.id);
+          if (execRes) {
+            for (const item of execRes.rawResults) {
+              addSource(item);
+            }
+            if (execRes.results && execRes.results.length > 0) {
+              processedSearchResultsByEntity.set(vq.query, execRes.results);
+            }
+
+            executedToolCalls.push({
+              toolName: "web_search",
+              query: vq.query,
+              result: execRes.formatted.slice(0, 1500),
+              status: "SUCCESS",
+              duration: execRes.duration,
+            });
+
+            toolResults.push({
+              toolCallId: vq.id,
+              name: "web_search",
+              result: execRes.formatted,
+            });
+
+            emitter.emitToolEnd("web_search", vq.query, execRes.results.length, execRes.duration);
+          }
+        }
+      }
+
+      for (const tr of toolResults) {
+        messages.push({
+          role: "tool",
+          tool_call_id: tr.toolCallId,
+          content: tr.result,
+        });
+      }
+
+      if (!loopBreaker.shouldContinue().continue || timeoutHandler.isExpired(agentStartTime)) {
+        emitter.emitStatus("Step limit reached. Formulating final answer...");
+        messages.push({
+          role: "system",
+          content: loopBreaker.getForceAnswerMessage(),
+        });
+      } else {
+        continue;
+      }
+    }
+
+    if (abortSignal?.aborted) return;
+
+    emitter.emitStatus("Composing final answer...");
+    emitter.emitAnswerStart();
+
+    const stream = await llm.chat.completions.create(
+      {
+        model: activeModel,
+        messages,
+        temperature,
+        stream: true,
+      },
+      { signal: abortSignal }
+    );
+
+    let fullAnswer = "";
+    for await (const chunk of stream) {
+      if (abortSignal?.aborted) return;
+      const content = chunk.choices[0]?.delta?.content;
+      if (content) {
+        fullAnswer += content;
+        emitter.emitAnswerChunk(content);
+      }
+    }
+
+    emitter.emitAnswerEnd(fullAnswer);
+
+    const processed = answerBuilder.postProcess(fullAnswer, answerContext);
+    emitter.emitSources(processed.citations);
+
+    let savedMessageId = `msg_${Date.now()}`;
+    if (shouldPersist && conversationId) {
+      const savedMsg = await messageService.addAssistantMessage(
+        conversationId,
+        processed.content,
+        executedToolCalls,
+        activeModel
+      );
+      savedMessageId = savedMsg.id;
+    }
+
+    emitter.emitDone(conversationId, savedMessageId);
+    return;
+  }
+
+  const fallback = "I could not complete the request within the allowed steps.";
+  emitter.emitAnswerStart();
+  emitter.emitAnswerChunk(fallback);
+  emitter.emitAnswerEnd(fallback);
+
+  let savedMessageId = `msg_${Date.now()}`;
+  if (shouldPersist && conversationId) {
+    const savedMsg = await messageService.addAssistantMessage(
+      conversationId,
+      fallback,
+      executedToolCalls,
+      activeModel
+    );
+    savedMessageId = savedMsg.id;
+  }
+
+  emitter.emitDone(conversationId, savedMessageId);
 }
