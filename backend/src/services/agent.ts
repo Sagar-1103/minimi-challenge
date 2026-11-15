@@ -4,7 +4,7 @@ import type {
   ChatCompletionMessage,
 } from "openai/resources/chat/completions";
 import { llm, getActiveModel } from "../lib/llm";
-import { searchWeb, type TavilySearchResponse, type TavilySearchResult } from "../lib/tavily";
+import { type TavilySearchResult } from "../lib/tavily";
 import { buildSystemPrompt } from "../prompts/system";
 import { webSearchArgsSchema } from "../schemas/search.schema";
 import { LLMError, NotFoundError } from "../middlewares/errorHandler";
@@ -15,6 +15,7 @@ import { formatHistoryForLLM, formatTimestamp } from "./history.formatter";
 import { DateResolver } from "./date-resolver";
 import { determineAnchorDate } from "./anchor-date";
 import { QueryBuilder } from "./query-builder";
+import { SearchExecutor } from "./search/search-executor";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
 import type { ToolCallRecordInput } from "../types/conversation.types";
@@ -63,27 +64,6 @@ function extractDomain(urlStr: string): string {
   }
 }
 
-function formatSearchResultForLLM(res: TavilySearchResponse): string {
-  if (!res.results || res.results.length === 0) {
-    return JSON.stringify({
-      query: res.query,
-      answer: res.answer ?? null,
-      message: "No results found for this query.",
-      results: [],
-    });
-  }
-
-  return JSON.stringify({
-    query: res.query,
-    answer: res.answer ?? null,
-    results: res.results.slice(0, 5).map((r) => ({
-      title: r.title,
-      url: r.url,
-      snippet: r.content ? r.content.slice(0, 600) : "",
-      publishedDate: r.publishedDate,
-    })),
-  });
-}
 
 async function callLLMWithRetry(
   params: Parameters<typeof llm.chat.completions.create>[0],
@@ -149,6 +129,11 @@ export async function runAgent(
   const dateResolver = new DateResolver(referenceDate);
   const anchorContext = determineAnchorDate(userMessage, rawHistory, dateResolver);
   const queryBuilder = new QueryBuilder(referenceDate, anchorContext?.anchorDate);
+  const searchExecutor = new SearchExecutor({
+    maxConcurrency: 5,
+    timeoutMs: 12000,
+    maxTotalSearches: 20,
+  });
 
   if (anchorContext) {
     logger.info(
@@ -243,8 +228,11 @@ export async function runAgent(
         toolCallsList.map((tc) => queryBuilder.enrichQuery(tc.arguments.query || ""))
       );
 
-      // Execute all tool calls in parallel using Promise.allSettled
-      const executionPromises = toolCallsList.map(async (tc) => {
+      // Separate valid tool calls from invalid ones
+      const validSearchQueries: Array<{ id: string; query: string }> = [];
+      const toolResults: ToolResult[] = [];
+
+      for (const tc of toolCallsList) {
         const startTime = Date.now();
         const parseResult = webSearchArgsSchema.safeParse(tc.arguments);
 
@@ -260,78 +248,48 @@ export async function runAgent(
             duration,
           });
 
-          return {
+          toolResults.push({
             toolCallId: tc.id,
             name: tc.name,
-            result: JSON.stringify({
-              error: errorMsg,
-              results: [],
-            }),
-          };
+            result: JSON.stringify({ error: errorMsg, results: [] }),
+          });
+        } else {
+          const rawQuery = parseResult.data.query;
+          const query = queryBuilder.enrichQuery(rawQuery);
+          validSearchQueries.push({ id: tc.id, query });
         }
+      }
 
-        const rawQuery = parseResult.data.query;
-        const query = queryBuilder.enrichQuery(rawQuery);
-        try {
-          const searchRes = await searchWeb({ query });
-          const duration = Date.now() - startTime;
+      // Execute valid searches through SearchExecutor (parallel, deduplicated, cached, and ranked)
+      if (validSearchQueries.length > 0) {
+        const batchResults = await searchExecutor.executeParallel(
+          validSearchQueries,
+          anchorContext?.anchorDate
+        );
 
-          for (const item of searchRes.results) {
-            addSource(item);
+        for (const vq of validSearchQueries) {
+          const execRes = batchResults.get(vq.id);
+          if (execRes) {
+            for (const item of execRes.rawResults) {
+              addSource(item);
+            }
+
+            executedToolCalls.push({
+              toolName: "web_search",
+              query: vq.query,
+              result: execRes.formatted.slice(0, 1500),
+              status: "SUCCESS",
+              duration: execRes.duration,
+            });
+
+            toolResults.push({
+              toolCallId: vq.id,
+              name: "web_search",
+              result: execRes.formatted,
+            });
           }
-
-          const formattedResult = formatSearchResultForLLM(searchRes);
-          executedToolCalls.push({
-            toolName: tc.name,
-            query,
-            result: formattedResult.slice(0, 1500),
-            status: "SUCCESS",
-            duration,
-          });
-
-          return {
-            toolCallId: tc.id,
-            name: tc.name,
-            result: formattedResult,
-          };
-        } catch (err: any) {
-          const duration = Date.now() - startTime;
-          logger.error(`Search failed for query "${query}": ${err.message}`);
-          executedToolCalls.push({
-            toolName: tc.name,
-            query,
-            result: JSON.stringify({ error: err.message }),
-            status: "FAILED",
-            duration,
-          });
-
-          return {
-            toolCallId: tc.id,
-            name: tc.name,
-            result: JSON.stringify({
-              query,
-              error: err.message,
-              results: [],
-            }),
-          };
         }
-      });
-
-      const settledResults = await Promise.allSettled(executionPromises);
-      const toolResults: ToolResult[] = settledResults.map((sr, idx) => {
-        if (sr.status === "fulfilled") {
-          return sr.value;
-        }
-        return {
-          toolCallId: toolCallsList[idx].id,
-          name: toolCallsList[idx].name,
-          result: JSON.stringify({
-            query: toolCallsList[idx].arguments.query,
-            error: sr.reason?.message ?? "Execution failed",
-            results: [],
-          }),
-        };
-      });
+      }
 
       // Append tool responses to messages
       for (const tr of toolResults) {
