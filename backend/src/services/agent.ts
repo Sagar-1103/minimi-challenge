@@ -30,6 +30,12 @@ import {
   type ProcessedAnswer,
   type ConfidenceLevel,
 } from "./answer";
+import {
+  LoopBreaker,
+  timeoutHandler,
+  errorRecovery,
+  contentFilter,
+} from "./safety";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
 import type { ToolCallRecordInput } from "../types/conversation.types";
@@ -389,10 +395,18 @@ export async function runAgent(
   // Trim messages if needed to fit within context window limits
   messages = historyManager.trimHistory(messages, 4000);
 
+  const agentStartTime = Date.now();
+  const loopBreaker = new LoopBreaker({
+    maxIterations,
+    maxToolCalls: 20,
+    maxDuplicateQueries: 2,
+  });
+
   let iteration = 0;
 
-  while (iteration < maxIterations) {
-    iteration++;
+  while (loopBreaker.shouldContinue().continue && !timeoutHandler.isExpired(agentStartTime)) {
+    loopBreaker.recordIteration();
+    iteration = loopBreaker.getIterationCount();
 
     logger.agent(iteration, "Sending request to LLM", {
       model: activeModel,
@@ -473,10 +487,31 @@ export async function runAgent(
           });
         } else {
           const rawQuery = parseResult.data.query;
+
+          if (loopBreaker.isDuplicateQuery(rawQuery)) {
+            const skipMsg = `Search skipped: duplicate query "${rawQuery}" was already executed. Please synthesize your answer using already collected findings.`;
+            logger.warn(`Tool call ${tc.id} duplicate query skipped: ${rawQuery}`);
+            executedToolCalls.push({
+              toolName: tc.name,
+              query: rawQuery,
+              result: skipMsg,
+              status: "SUCCESS",
+              duration: 0,
+            });
+            toolResults.push({
+              toolCallId: tc.id,
+              name: tc.name,
+              result: skipMsg,
+            });
+            continue;
+          }
+
           const query = queryBuilder.enrichQuery(rawQuery);
           validSearchQueries.push({ id: tc.id, query });
         }
       }
+
+      loopBreaker.recordToolCalls(toolCallsList);
 
       // Execute valid searches through SearchExecutor (parallel, deduplicated, cached, and ranked)
       if (validSearchQueries.length > 0) {
@@ -530,15 +565,12 @@ export async function runAgent(
         timestamp: new Date().toISOString(),
       });
 
-      // Check if we hit the limit after executing tools
-      if (iteration >= maxIterations) {
-        logger.warn(
-          `Agent reached max iterations (${maxIterations}). Forcing final answer.`
-        );
+      // Check if we hit the limit after executing tools or time budget expired
+      if (!loopBreaker.shouldContinue().continue || timeoutHandler.isExpired(agentStartTime)) {
+        logger.warn("Agent reached step limit or timeout. Forcing final answer.");
         messages.push({
           role: "system",
-          content:
-            "You have reached the maximum search iterations. Synthesize and provide your final answer now with whatever information you have gathered. State clearly if any part could not be verified. Do not make further tool calls.",
+          content: loopBreaker.getForceAnswerMessage(),
         });
 
         const forcedResponse = await callLLMWithRetry({

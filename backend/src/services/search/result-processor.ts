@@ -1,5 +1,6 @@
 import type { TavilySearchResult } from "../../lib/tavily";
 import { SourceEvaluator, sourceEvaluator } from "./source-evaluator";
+import { injectionFilter } from "../safety/injection-filter";
 
 export interface ProcessedSearchResult {
   title: string;
@@ -72,11 +73,13 @@ export class ResultProcessor {
     return processed.slice(0, maxResults);
   }
 
-  // Clean HTML artifacts and truncate snippets to prevent context window bloat
+  // Clean HTML artifacts, neutralize prompt injections, and truncate snippets
   public cleanContent(text: string, maxChars = 750): string {
     if (!text) return "";
 
-    const cleaned = text
+    const sanitized = injectionFilter.sanitize(text);
+
+    const cleaned = sanitized
       .replace(/\s+/g, " ")
       .replace(/[\r\n\t]+/g, " ")
       .trim();
@@ -105,7 +108,7 @@ export class ResultProcessor {
     return unique;
   }
 
-  // Format ranked results for the LLM tool response
+  // Format ranked results for the LLM tool response wrapped in untrusted data delimiters
   public formatForLLM(results: ProcessedSearchResult[]): string {
     if (results.length === 0) {
       return "No relevant search results found.";
@@ -120,7 +123,7 @@ export class ResultProcessor {
         const badgeStr = badges.length > 0 ? ` [${badges.join(" | ")}]` : "";
         const dateStr = r.publishedDate ? ` | Published: ${r.publishedDate}` : "";
 
-        return `### Result ${index + 1}: ${r.title}${badgeStr}\n- **URL**: ${r.url}\n- **Domain**: ${r.domain}${dateStr}\n- **Snippet**: ${r.content}\n`;
+        return `### Result ${index + 1}: ${r.title}${badgeStr}\n- **URL**: ${r.url}\n- **Domain**: ${r.domain}${dateStr}\n- **Snippet**:\n<search_result source="${r.url}"${r.publishedDate ? ` date="${r.publishedDate}"` : ""}>\n${r.content}\n</search_result>\n`;
       })
       .join("\n");
   }
