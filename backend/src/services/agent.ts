@@ -16,6 +16,7 @@ import { DateResolver } from "./date-resolver";
 import { determineAnchorDate } from "./anchor-date";
 import { QueryBuilder } from "./query-builder";
 import { SearchExecutor } from "./search/search-executor";
+import type { ProcessedSearchResult } from "./search/result-processor";
 import {
   historyRetriever,
   ambiguityHandler,
@@ -23,6 +24,12 @@ import {
   historyManager,
   type HistoryMatch,
 } from "./memory";
+import {
+  answerBuilder,
+  type AnswerContext,
+  type ProcessedAnswer,
+  type ConfidenceLevel,
+} from "./answer";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
 import type { ToolCallRecordInput } from "../types/conversation.types";
@@ -61,6 +68,9 @@ export interface AgentRunResult {
   messageId: string;
   sources: SourceCitation[];
   steps: AgentStep[];
+  confidenceLevel?: ConfidenceLevel;
+  entitiesCovered?: string[];
+  entitiesMissed?: string[];
 }
 
 function extractDomain(urlStr: string): string {
@@ -144,6 +154,8 @@ export async function runAgent(
     timeoutMs: 12000,
     maxTotalSearches: 20,
   });
+
+  const processedSearchResultsByEntity = new Map<string, ProcessedSearchResult[]>();
 
   if (anchorContext) {
     logger.info(
@@ -328,6 +340,28 @@ export async function runAgent(
     }
   }
 
+  const isReverify =
+    !!reference &&
+    (reference.type === "implicit_followup" ||
+      /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage));
+  const questionType = answerBuilder.detectQuestionType(
+    userMessage,
+    !!anchorContext,
+    isReverify
+  );
+  const entities = answerBuilder.extractEntities(userMessage);
+
+  const answerContext: AnswerContext = {
+    userQuestion: userMessage,
+    questionType,
+    searchResults: processedSearchResultsByEntity,
+    entities,
+    anchorDate: anchorContext?.anchorDate,
+    todayDate: referenceDate,
+  };
+
+  const answerDirective = answerBuilder.buildAnswerPrompt(answerContext);
+
   const currentFormattedUserMessage = `${formatTimestamp(referenceDate)} ${userMessage}`;
 
   let messages: ChatCompletionMessageParam[] = [
@@ -337,6 +371,7 @@ export async function runAgent(
         referenceDate,
         timezone: "UTC",
         anchorDate: anchorContext,
+        answerDirective,
       }),
     },
     ...priorHistory,
@@ -457,6 +492,10 @@ export async function runAgent(
               addSource(item);
             }
 
+            if (execRes.results && execRes.results.length > 0) {
+              processedSearchResultsByEntity.set(vq.query, execRes.results);
+            }
+
             executedToolCalls.push({
               toolName: "web_search",
               query: vq.query,
@@ -508,14 +547,26 @@ export async function runAgent(
           temperature,
         });
 
-        const finalContent =
+        const rawContent =
           forcedResponse.choices[0]?.message?.content ||
           "I have gathered the available information, but reached the limit before completing further searches.";
+
+        const processed = answerBuilder.postProcess(rawContent, answerContext);
+        for (const c of processed.citations) {
+          if (!sourcesMap.has(c.url)) {
+            sourcesMap.set(c.url, {
+              title: c.title,
+              url: c.url,
+              domain: c.domain,
+              date: c.publishedDate,
+            });
+          }
+        }
 
         steps.push({
           index: iteration + 1,
           type: "final_answer",
-          output: finalContent,
+          output: processed.content,
           timestamp: new Date().toISOString(),
         });
 
@@ -523,7 +574,7 @@ export async function runAgent(
         if (shouldPersist && conversationId) {
           const savedMsg = await messageService.addAssistantMessage(
             conversationId,
-            finalContent,
+            processed.content,
             executedToolCalls,
             activeModel
           );
@@ -531,11 +582,14 @@ export async function runAgent(
         }
 
         return {
-          answer: finalContent,
+          answer: processed.content,
           conversationId,
           messageId: savedMessageId,
           sources: Array.from(sourcesMap.values()),
           steps,
+          confidenceLevel: processed.confidenceLevel,
+          entitiesCovered: processed.entitiesCovered,
+          entitiesMissed: processed.entitiesMissed,
         };
       }
 
@@ -544,13 +598,25 @@ export async function runAgent(
     }
 
     // No tool calls - the model generated a final answer
-    const finalAnswer = message.content || "";
+    const rawAnswer = message.content || "";
     logger.agent(iteration, "Final answer generated");
+
+    const processed = answerBuilder.postProcess(rawAnswer, answerContext);
+    for (const c of processed.citations) {
+      if (!sourcesMap.has(c.url)) {
+        sourcesMap.set(c.url, {
+          title: c.title,
+          url: c.url,
+          domain: c.domain,
+          date: c.publishedDate,
+        });
+      }
+    }
 
     steps.push({
       index: iteration,
       type: "final_answer",
-      output: finalAnswer,
+      output: processed.content,
       timestamp: new Date().toISOString(),
     });
 
@@ -558,7 +624,7 @@ export async function runAgent(
     if (shouldPersist && conversationId) {
       const savedMsg = await messageService.addAssistantMessage(
         conversationId,
-        finalAnswer,
+        processed.content,
         executedToolCalls,
         activeModel
       );
@@ -566,11 +632,14 @@ export async function runAgent(
     }
 
     return {
-      answer: finalAnswer,
+      answer: processed.content,
       conversationId,
       messageId: savedMessageId,
       sources: Array.from(sourcesMap.values()),
       steps,
+      confidenceLevel: processed.confidenceLevel,
+      entitiesCovered: processed.entitiesCovered,
+      entitiesMissed: processed.entitiesMissed,
     };
   }
 
@@ -593,5 +662,8 @@ export async function runAgent(
     messageId: savedMessageId,
     sources: Array.from(sourcesMap.values()),
     steps,
+    confidenceLevel: "unverifiable",
+    entitiesCovered: [],
+    entitiesMissed: answerContext.entities,
   };
 }
