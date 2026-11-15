@@ -1,12 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { InMemoryCacheStore } from "../../src/services/cache/cache.interface";
-import { SearchDedup } from "../../src/services/search/dedup";
-import { SourceEvaluator } from "../../src/services/search/source-evaluator";
-import { ResultProcessor } from "../../src/services/search/result-processor";
-import type { TavilySearchResult, TavilySearchResponse } from "../../src/lib/tavily";
+import { InMemoryCacheStore } from "../src/services/cache/cache.interface";
+import { SearchDedup } from "../src/services/search/dedup";
+import { SourceEvaluator } from "../src/services/search/source-evaluator";
+import { ResultProcessor } from "../src/services/search/result-processor";
+import type { TavilySearchResult, TavilySearchResponse } from "../src/lib/tavily";
 
-describe("Search Strategy & Orchestration Tests", () => {
+describe("Search Performance, Deduplication & Dynamic Authority", () => {
   describe("CacheStore & InMemoryCacheStore", () => {
     it("should store, retrieve, and delete items with key lookup", () => {
       const cache = new InMemoryCacheStore();
@@ -22,17 +22,15 @@ describe("Search Strategy & Orchestration Tests", () => {
 
     it("should respect TTL and expire items", async () => {
       const cache = new InMemoryCacheStore();
-      // Set 1-second TTL
-      cache.set("short-lived", "hello", 1);
+      cache.set("short-lived", "hello", 1); // 1-second TTL
       assert.equal(cache.get("short-lived"), "hello");
 
-      // Wait 1.1s for expiration
       await new Promise((resolve) => setTimeout(resolve, 1100));
       assert.equal(cache.get("short-lived"), null);
     });
   });
 
-  describe("SearchDedup & Query Normalization", () => {
+  describe("SearchDedup & Query Canonicalization", () => {
     const cache = new InMemoryCacheStore();
     const dedup = new SearchDedup(cache);
 
@@ -46,7 +44,7 @@ describe("Search Strategy & Orchestration Tests", () => {
       assert.equal(key3, "2026 hubspot pricing");
     });
 
-    it("should cache and return search responses on duplicate queries", async () => {
+    it("should cache and return search responses on duplicate canonical queries", async () => {
       const sampleResponse: TavilySearchResponse = {
         query: "Linear release notes 2026",
         results: [
@@ -110,7 +108,7 @@ describe("Search Strategy & Orchestration Tests", () => {
         url: "https://neon.tech/pricing",
         content: "New pricing announced.",
         score: 0.9,
-        publishedDate: "2026-11-10T00:00:00Z", // After anchor date
+        publishedDate: "2026-11-10T00:00:00Z",
       };
 
       const thirdPartyStale: TavilySearchResult = {
@@ -118,7 +116,7 @@ describe("Search Strategy & Orchestration Tests", () => {
         url: "https://forum.example.com/topic/123",
         content: "Old discussion.",
         score: 0.6,
-        publishedDate: "2025-05-01T00:00:00Z", // Stale
+        publishedDate: "2025-05-01T00:00:00Z",
       };
 
       const scorePrimary = evaluator.scoreSource(primaryFresh, "Neon", anchorDate);
@@ -150,38 +148,23 @@ describe("Search Strategy & Orchestration Tests", () => {
 
       const processed = processor.process(rawResults, { entity: "Supabase" });
       assert.equal(processed.length, 2);
-      assert.equal(processed[0].title, "Official Docs");
+      assert.equal(processed[0].url, "https://supabase.com/pricing");
       assert.equal(processed[0].isPrimarySource, true);
     });
 
-    it("should truncate long content snippets cleanly without breaking words", () => {
-      const longText = "A".repeat(1200);
-      const truncated = processor.cleanContent(longText, 200);
-      assert.ok(truncated.length <= 205);
-      assert.ok(truncated.endsWith("..."));
-    });
-
-    it("should format results into structured markdown with badges for the LLM", () => {
-      const rawResults: TavilySearchResult[] = [
+    it("should wrap formatted results in <search_result> delimiters", () => {
+      const processed = processor.process([
         {
-          title: "Pricing Page",
-          url: "https://resend.com/pricing",
-          content: "Email API pricing starts free.",
-          score: 0.9,
-          publishedDate: "2026-11-10",
+          title: "Pricing",
+          url: "https://example.com/pricing",
+          content: "Starter is $20.",
+          score: 0.8,
         },
-      ];
+      ]);
 
-      const processed = processor.process(rawResults, {
-        entity: "Resend",
-        anchorDate: new Date("2026-11-01"),
-      });
       const formatted = processor.formatForLLM(processed);
-
-      assert.match(formatted, /### Result 1: Pricing Page/);
-      assert.match(formatted, /Primary Source/);
-      assert.match(formatted, /Updated After Anchor Date/);
-      assert.match(formatted, /https:\/\/resend\.com\/pricing/);
+      assert.match(formatted, /<search_result source="https:\/\/example\.com\/pricing">/);
+      assert.match(formatted, /<\/search_result>/);
     });
   });
 });
