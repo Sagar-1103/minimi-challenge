@@ -16,6 +16,13 @@ import { DateResolver } from "./date-resolver";
 import { determineAnchorDate } from "./anchor-date";
 import { QueryBuilder } from "./query-builder";
 import { SearchExecutor } from "./search/search-executor";
+import {
+  historyRetriever,
+  ambiguityHandler,
+  reVerifier,
+  historyManager,
+  type HistoryMatch,
+} from "./memory";
 import type { AgentStep, ToolCall, ToolResult } from "../types/agent.types";
 import type { SourceCitation } from "../types/chat.types";
 import type { ToolCallRecordInput } from "../types/conversation.types";
@@ -102,6 +109,7 @@ export async function runAgent(
   const shouldPersist = options.persist ?? true;
 
   let conversationId = options.conversationId;
+  let currentUserMessageId: string | undefined;
   let priorHistory: ChatCompletionMessageParam[] = [];
   let rawHistory: Array<{ role: string; content: string | null; createdAt?: Date | string }> = [];
 
@@ -114,11 +122,13 @@ export async function runAgent(
       }
       rawHistory = existingConv.messages;
       priorHistory = formatHistoryForLLM(existingConv.messages);
-      await messageService.addUserMessage(conversationId, userMessage);
+      const addedMsg = await messageService.addUserMessage(conversationId, userMessage);
+      currentUserMessageId = addedMsg.id;
     } else {
       const newConv = await conversationService.create(userMessage);
       conversationId = newConv.id;
-      await messageService.addUserMessage(conversationId, userMessage);
+      const addedMsg = await messageService.addUserMessage(conversationId, userMessage);
+      currentUserMessageId = addedMsg.id;
     }
   } else if (options.history) {
     priorHistory = options.history;
@@ -156,9 +166,171 @@ export async function runAgent(
     }
   };
 
+  // Check for past conversation recall or re-verification intent
+  const reference = ambiguityHandler.detectReference(userMessage, dateResolver);
+  let recalledHistoryPrompt = "";
+
+  if (reference) {
+    if (reference.type === "implicit_followup") {
+      const lastAssistantTurn = rawHistory
+        .slice()
+        .reverse()
+        .find((m) => m.role === "assistant" && m.content);
+
+      if (lastAssistantTurn && lastAssistantTurn.content) {
+        const report = await reVerifier.verify(
+          conversationId || "",
+          undefined,
+          undefined,
+          dateResolver,
+          currentUserMessageId
+        );
+        if (report) {
+          recalledHistoryPrompt = reVerifier.formatReportForLLM(report);
+        }
+      }
+    } else {
+      let matches: HistoryMatch[] = [];
+      if (reference.type === "date_and_topic") {
+        matches = await historyRetriever.findByDateAndTopic(
+          conversationId || "",
+          reference.dateExpression,
+          reference.topic,
+          dateResolver,
+          currentUserMessageId
+        );
+      } else if (reference.type === "date_only") {
+        matches = await historyRetriever.findByDate(
+          conversationId || "",
+          reference.dateExpression,
+          dateResolver,
+          currentUserMessageId
+        );
+      } else if (reference.type === "topic_only") {
+        matches = await historyRetriever.findByTopic(
+          conversationId || "",
+          reference.topic,
+          currentUserMessageId
+        );
+      }
+
+      if (matches.length === 0) {
+        matches = await historyRetriever.findAcrossConversations(
+          reference.type !== "topic_only" ? reference.dateExpression : undefined,
+          reference.type !== "date_only" ? reference.topic : undefined,
+          dateResolver,
+          currentUserMessageId
+        );
+      }
+
+      // If no past turn was found, state it honestly without fabricating history
+      if (matches.length === 0) {
+        const targetDesc =
+          reference.type === "date_only"
+            ? reference.dateExpression
+            : reference.type === "topic_only"
+            ? reference.topic
+            : `${reference.dateExpression} regarding ${reference.topic}`;
+
+        const notFoundAnswer = `I checked our conversation history, but I couldn't find any recorded questions or discussions matching "${targetDesc}".`;
+
+        steps.push({
+          index: 1,
+          type: "final_answer",
+          output: notFoundAnswer,
+          timestamp: new Date().toISOString(),
+        });
+
+        let savedMessageId = `msg_${Date.now()}`;
+        if (shouldPersist && conversationId) {
+          const savedMsg = await messageService.addAssistantMessage(
+            conversationId,
+            notFoundAnswer,
+            [],
+            activeModel
+          );
+          savedMessageId = savedMsg.id;
+        }
+
+        return {
+          answer: notFoundAnswer,
+          conversationId,
+          messageId: savedMessageId,
+          sources: [],
+          steps,
+        };
+      }
+
+      // If multiple turns match on a date reference, ask for user clarification
+      if (matches.length > 1 && reference.type === "date_only") {
+        const disambiguationAnswer = ambiguityHandler.formatDisambiguation(matches);
+
+        steps.push({
+          index: 1,
+          type: "final_answer",
+          output: disambiguationAnswer,
+          timestamp: new Date().toISOString(),
+        });
+
+        let savedMessageId = `msg_${Date.now()}`;
+        if (shouldPersist && conversationId) {
+          const savedMsg = await messageService.addAssistantMessage(
+            conversationId,
+            disambiguationAnswer,
+            [],
+            activeModel
+          );
+          savedMessageId = savedMsg.id;
+        }
+
+        return {
+          answer: disambiguationAnswer,
+          conversationId,
+          messageId: savedMessageId,
+          sources: [],
+          steps,
+        };
+      }
+
+      // Single match: retrieve full exchange and optionally re-verify claims
+      const matchedTurn = matches[0];
+      const exchange = await historyRetriever.getFullExchange(matchedTurn.message.id);
+
+      if (exchange) {
+        const asksReverify = /\b(still\s+correct|accurate|changed|current|update|valid|prices?)\b/i.test(
+          userMessage
+        );
+
+        let reverifyBlock = "";
+        if (asksReverify) {
+          const report = await reVerifier.verify(
+            exchange.userMessage.conversationId,
+            reference.type !== "topic_only" ? reference.dateExpression : undefined,
+            reference.type !== "date_only" ? reference.topic : undefined,
+            dateResolver,
+            currentUserMessageId
+          );
+          if (report) {
+            reverifyBlock = `\n\n${reVerifier.formatReportForLLM(report)}`;
+          }
+        }
+
+        recalledHistoryPrompt = [
+          "### Recalled Historical Conversation",
+          `- **Date**: ${dateResolver.formatForDisplay(exchange.timestamp)}`,
+          `- **User Question**: "${exchange.userMessage.content}"`,
+          `- **Assistant Answer**: "${exchange.assistantResponse.content}"`,
+          reverifyBlock,
+          "",
+          "Ground your answer strictly in this recalled exchange. Restate the question and answer clearly. If re-verification details are provided, indicate whether the old facts remain accurate or have changed.",
+        ].join("\n");
+      }
+    }
+  }
+
   const currentFormattedUserMessage = `${formatTimestamp(referenceDate)} ${userMessage}`;
 
-  const messages: ChatCompletionMessageParam[] = [
+  let messages: ChatCompletionMessageParam[] = [
     {
       role: "system",
       content: buildSystemPrompt({
@@ -168,8 +340,19 @@ export async function runAgent(
       }),
     },
     ...priorHistory,
+    ...(recalledHistoryPrompt
+      ? [
+          {
+            role: "system" as const,
+            content: recalledHistoryPrompt,
+          },
+        ]
+      : []),
     { role: "user", content: currentFormattedUserMessage },
   ];
+
+  // Trim messages if needed to fit within context window limits
+  messages = historyManager.trimHistory(messages, 4000);
 
   let iteration = 0;
 
