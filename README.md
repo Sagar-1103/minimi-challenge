@@ -18,42 +18,31 @@ An AI chat agent with live web search, calendar intelligence, factual claim re-v
 
 For in-depth architectural decisions, trade-offs, and design rationale, see **[`DESIGN.md`](./DESIGN.md)**.
 
+![Mimi Architecture](./mimi-architecture.png)
+
 ```mermaid
 flowchart TD
-    User["User Query\n(Next.js 15 Chat UI)"] --> Safety["Safety & Injection Filter\n(Prompt Sanitization)"]
-    Safety --> Intent["Intent & Ambiguity Handler\n(Question Type Classifier)"]
+    User["User Query"] --> Safety["Safety & Injection Filter"]
+    Safety --> Intent["Intent & Ambiguity Handler"]
 
-    subgraph SearchPipeline ["Live Web Search Pipeline"]
-        Resolver["DateResolver & Calendar Grounding\n(UTC Midnight Normalization)"]
-        QueryBuilder["Date-Aware QueryBuilder\n(Year Modernization: 2022 to 2026)"]
-        Tavily["Parallel Search Executor\n(Tavily Multi-Query Fan-Out)"]
-        Scorer["Source Quality Evaluator\n(Primary Vendor Authority Boost)"]
-        
-        Resolver --> QueryBuilder --> Tavily --> Scorer
-    end
+    Intent -->|"Temporal / Live Queries"| Resolver["DateResolver & Calendar Grounding"]
+    Resolver --> QueryBuilder["Date-Aware QueryBuilder"]
+    QueryBuilder --> Search["Parallel Search Executor"]
+    Search --> Scorer["Source Quality Evaluator"]
 
-    subgraph MemoryPipeline ["Dual-Layer Memory Pipeline"]
-        Strategy{"Recall Intent"}
-        TurnLookup["Chronological Turn Index\n(SQL Timestamp Lookup)"]
-        VectorStore["pgvector Semantic Store\n(Gemini 768-dim HNSW Index)"]
-        ClaimExtractor["Claim Extractor\n(Pricing & Quota Isolation)"]
-        
-        Strategy -->|"Exact Date Mention"| TurnLookup
-        Strategy -->|"Zero-Keyword Concept"| VectorStore
-        TurnLookup --> ClaimExtractor
-        VectorStore --> ClaimExtractor
-    end
+    Intent -->|"Explicit / Semantic Recall"| Strategy{"Memory Strategy"}
+    Strategy -->|"Exact Date Mention"| TurnIndex["Chronological Turn Index"]
+    Strategy -->|"Semantic Concept"| VectorStore["pgvector Semantic Store"]
+    TurnIndex --> ClaimExtractor["Claim Extractor"]
+    VectorStore --> ClaimExtractor
 
-    Intent -->|"Temporal / Change Query"| Resolver
-    Intent -->|"Past Memory Recall"| Strategy
-
-    Scorer --> ReVerifier["Factual Re-Verifier\n(Current vs Historical Diff)"]
+    Scorer --> ReVerifier["Factual Re-Verifier"]
     ClaimExtractor --> ReVerifier
 
-    ReVerifier --> AnswerBuilder["AnswerBuilder\n(Headline-First + Tables)"]
-    AnswerBuilder --> Tone["Tone & Persona Guardrail\n(Strict Anti-Robotic Rules)"]
-    Tone --> SSE["SSE Event Streamer\n(Status, Tools, Chunks, Sources)"]
-    SSE --> Client["Client Real-Time Stream\n(Markdown & Citation Badges)"]
+    ReVerifier --> AnswerBuilder["AnswerBuilder"]
+    AnswerBuilder --> Tone["Tone & Persona Guardrail"]
+    Tone --> SSE["SSE Event Streamer"]
+    SSE --> Client["Client Real-Time Stream"]
 ```
 
 ---
