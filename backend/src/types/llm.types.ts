@@ -1,4 +1,4 @@
-export type LLMProvider = "deepseek" | "openrouter";
+export type LLMProvider = "openrouter";
 
 export interface LLMProviderConfig {
   provider: LLMProvider;

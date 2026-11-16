@@ -16,7 +16,7 @@ describe("Hiring Challenge Benchmark Scenarios (docs/task.md)", () => {
   const ambiguityHandler = new AmbiguityHandler();
   const claimExtractor = new ClaimExtractor();
   const answerBuilder = new AnswerBuilder();
-  const queryBuilder = new QueryBuilder(dateResolver);
+  const queryBuilder = new QueryBuilder(fixedReference);
 
   describe("Benchmark Scenario 1: CRM Tools Change Detection", () => {
     const prompt =
@@ -39,17 +39,19 @@ describe("Hiring Challenge Benchmark Scenarios (docs/task.md)", () => {
       assert.equal(questionType, "change_detection");
 
       const promptDirective = answerBuilder.buildAnswerPrompt({
+        userQuestion: prompt,
         questionType,
-        hasAnchorDate: true,
-        isReverify: false,
+        searchResults: new Map(),
         entities: ["HubSpot", "Salesforce", "Pipedrive", "Zoho", "Close"],
+        anchorDate: anchor?.anchorDate,
+        todayDate: fixedReference,
       });
 
       assert.match(promptDirective, /CHANGE DETECTION FORMATTING DIRECTIVE/);
       assert.match(promptDirective, /Lead with a clear summary headline/);
       assert.match(promptDirective, /markdown summary table/);
-      assert.match(promptDirective, /⚠️ Changed/);
-      assert.match(promptDirective, /✅ No change found/);
+      assert.match(promptDirective, /Changed/);
+      assert.match(promptDirective, /No change found/);
     });
 
     it("should formulate targeted search queries including current year and entity names", () => {

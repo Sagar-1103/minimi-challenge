@@ -37,7 +37,7 @@ describe("Answer Quality, Table Formatting & SSE Streaming Protocol", () => {
       assert.match(markdown, /\[HubSpot Pricing & Plans 2026 - Official\]\(https:\/\/www\.hubspot\.com\/pricing\/crm\)/);
     });
 
-    it("should generate change-detection tables explicitly marking '⚠️ Changed' vs '✅ No change found'", () => {
+    it("should generate change-detection tables explicitly marking 'Changed' vs 'No change found'", () => {
       const markdown = tableFormatter.formatChangeTable([
         {
           name: "HubSpot",
@@ -54,8 +54,8 @@ describe("Answer Quality, Table Formatting & SSE Streaming Protocol", () => {
       ]);
 
       assert.match(markdown, /\|\s*Tool\s*\|\s*Status\s*\|\s*Notable Updates\s*\|\s*Sources\s*\|/);
-      assert.match(markdown, /⚠️ Changed/);
-      assert.match(markdown, /✅ No change found/);
+      assert.match(markdown, /Changed/);
+      assert.match(markdown, /No change found/);
     });
   });
 
