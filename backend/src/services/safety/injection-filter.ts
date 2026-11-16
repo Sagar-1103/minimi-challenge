@@ -8,7 +8,7 @@ export interface InjectionDetection {
 
 const INJECTION_RULES = [
   {
-    regex: /ignore\s+(all\s+|your\s+|previous\s+)?(instructions|prompts?|rules|guidelines)/gi,
+    regex: /ignore\s+(?:all\s+|your\s+|previous\s+)*(?:instructions|prompts?|rules|guidelines)/gi,
     name: "ignore_instructions",
     severity: "high" as const,
     replacement: "[filtered: instruction override attempt]",

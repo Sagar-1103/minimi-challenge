@@ -33,9 +33,15 @@ export function determineAnchorDate(
   for (const expr of expressions) {
     const resolution: DateResolution | null = dateResolver.resolve(expr.expression);
     if (resolution && resolution.resolvedDate.getTime() <= today.getTime()) {
+      const todayMidnight = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+      const resMidnight = Date.UTC(
+        resolution.resolvedDate.getUTCFullYear(),
+        resolution.resolvedDate.getUTCMonth(),
+        resolution.resolvedDate.getUTCDate()
+      );
       const daysBetween = Math.max(
         0,
-        Math.round((today.getTime() - resolution.resolvedDate.getTime()) / (1000 * 60 * 60 * 24))
+        Math.floor((todayMidnight - resMidnight) / (1000 * 60 * 60 * 24))
       );
 
       return {

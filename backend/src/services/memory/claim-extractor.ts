@@ -90,10 +90,11 @@ Return ONLY the raw JSON array, with no markdown code fences and no extra conver
     let claimIdx = 0;
 
     for (const line of lines) {
-      // Look for pricing, limits, numbers, or specific metrics
-      const valueMatch = line.match(
-        /(\$\d+(?:\.\d+)?(?:\/(?:mo|month|yr|year|user))?|\d+(?:\.\d+)?\s*(?:gb|mb|tb|core|cpu|ram|projects?|users?|members?|days?|queries|tokens?)|free\s+tier|open-source|v\d+(?:\.\d+)?)/i
+      // Look for pricing, limits, numbers, or specific metrics (prioritizing quantitative values over generic terms)
+      const quantMatch = line.match(
+        /(\$\d+(?:\.\d+)?(?:\/(?:mo|month|yr|year|user))?|\d+(?:\.\d+)?\s*(?:gb|mb|tb|core|cpu|ram|projects?|users?|members?|days?|queries|tokens?)|v\d+(?:\.\d+)?)/i
       );
+      const valueMatch = quantMatch || line.match(/(free\s+tier|open-source)/i);
 
       // Look for capitalized brand or product entity at word boundaries
       const entityMatch = line.match(/\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+)?)\b/);

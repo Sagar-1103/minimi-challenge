@@ -188,172 +188,97 @@ export async function runAgent(
     }
   };
 
-  // Check for past conversation recall or re-verification intent
-  const reference = ambiguityHandler.detectReference(userMessage, dateResolver);
-  let recalledHistoryPrompt = "";
+  // Unified semantic memory retrieval for cross-conversation recall and past context grounding
+  const memoryResult = await historyRetriever.retrieveContextForQuery({
+    userMessage,
+    conversationId,
+    currentUserMessageId,
+    dateResolver,
+  });
 
-  if (reference) {
-    if (reference.type === "implicit_followup") {
-      const lastAssistantTurn = rawHistory
-        .slice()
-        .reverse()
-        .find((m) => m.role === "assistant" && m.content);
+  // If multiple turns match on a date reference, ask for user clarification
+  if (memoryResult.ambiguousChoices && memoryResult.ambiguousChoices.length > 1) {
+    const disambiguationAnswer = ambiguityHandler.formatDisambiguation(memoryResult.ambiguousChoices);
 
-      if (lastAssistantTurn && lastAssistantTurn.content) {
-        const report = await reVerifier.verify(
-          conversationId || "",
-          undefined,
-          undefined,
-          dateResolver,
-          currentUserMessageId
-        );
-        if (report) {
-          recalledHistoryPrompt = reVerifier.formatReportForLLM(report);
-        }
-      }
-    } else {
-      let matches: HistoryMatch[] = [];
-      if (reference.type === "date_and_topic") {
-        matches = await historyRetriever.findByDateAndTopic(
-          conversationId || "",
-          reference.dateExpression,
-          reference.topic,
-          dateResolver,
-          currentUserMessageId
-        );
-      } else if (reference.type === "date_only") {
-        matches = await historyRetriever.findByDate(
-          conversationId || "",
-          reference.dateExpression,
-          dateResolver,
-          currentUserMessageId
-        );
-      } else if (reference.type === "topic_only") {
-        matches = await historyRetriever.findByTopic(
-          conversationId || "",
-          reference.topic,
-          currentUserMessageId
-        );
-      }
+    steps.push({
+      index: 1,
+      type: "final_answer",
+      output: disambiguationAnswer,
+      timestamp: new Date().toISOString(),
+    });
 
-      if (matches.length === 0) {
-        matches = await historyRetriever.findAcrossConversations(
-          reference.type !== "topic_only" ? reference.dateExpression : undefined,
-          reference.type !== "date_only" ? reference.topic : undefined,
-          dateResolver,
-          currentUserMessageId
-        );
-      }
+    let savedMessageId = `msg_${Date.now()}`;
+    if (shouldPersist && conversationId) {
+      const savedMsg = await messageService.addAssistantMessage(
+        conversationId,
+        disambiguationAnswer,
+        [],
+        activeModel
+      );
+      savedMessageId = savedMsg.id;
+    }
 
-      // If no past turn was found, state it honestly without fabricating history
-      if (matches.length === 0) {
-        const targetDesc =
-          reference.type === "date_only"
-            ? reference.dateExpression
-            : reference.type === "topic_only"
-            ? reference.topic
-            : `${reference.dateExpression} regarding ${reference.topic}`;
+    return {
+      answer: disambiguationAnswer,
+      conversationId,
+      messageId: savedMessageId,
+      sources: [],
+      steps,
+    };
+  }
 
-        const notFoundAnswer = `I checked our conversation history, but I couldn't find any recorded questions or discussions matching "${targetDesc}".`;
+  // If user explicitly asked about past history/dates, but zero records exist:
+  if (memoryResult.isExplicitRecall && memoryResult.matches.length === 0) {
+    const notFoundAnswer =
+      "I checked our conversation history, but I couldn't find any recorded questions or discussions matching that. Could you remind me?";
 
-        steps.push({
-          index: 1,
-          type: "final_answer",
-          output: notFoundAnswer,
-          timestamp: new Date().toISOString(),
-        });
+    steps.push({
+      index: 1,
+      type: "final_answer",
+      output: notFoundAnswer,
+      timestamp: new Date().toISOString(),
+    });
 
-        let savedMessageId = `msg_${Date.now()}`;
-        if (shouldPersist && conversationId) {
-          const savedMsg = await messageService.addAssistantMessage(
-            conversationId,
-            notFoundAnswer,
-            [],
-            activeModel
-          );
-          savedMessageId = savedMsg.id;
-        }
+    let savedMessageId = `msg_${Date.now()}`;
+    if (shouldPersist && conversationId) {
+      const savedMsg = await messageService.addAssistantMessage(
+        conversationId,
+        notFoundAnswer,
+        [],
+        activeModel
+      );
+      savedMessageId = savedMsg.id;
+    }
 
-        return {
-          answer: notFoundAnswer,
-          conversationId,
-          messageId: savedMessageId,
-          sources: [],
-          steps,
-        };
-      }
+    return {
+      answer: notFoundAnswer,
+      conversationId,
+      messageId: savedMessageId,
+      sources: [],
+      steps,
+    };
+  }
 
-      // If multiple turns match on a date reference, ask for user clarification
-      if (matches.length > 1 && reference.type === "date_only") {
-        const disambiguationAnswer = ambiguityHandler.formatDisambiguation(matches);
+  let recalledHistoryPrompt = memoryResult.recalledHistoryPrompt;
 
-        steps.push({
-          index: 1,
-          type: "final_answer",
-          output: disambiguationAnswer,
-          timestamp: new Date().toISOString(),
-        });
-
-        let savedMessageId = `msg_${Date.now()}`;
-        if (shouldPersist && conversationId) {
-          const savedMsg = await messageService.addAssistantMessage(
-            conversationId,
-            disambiguationAnswer,
-            [],
-            activeModel
-          );
-          savedMessageId = savedMsg.id;
-        }
-
-        return {
-          answer: disambiguationAnswer,
-          conversationId,
-          messageId: savedMessageId,
-          sources: [],
-          steps,
-        };
-      }
-
-      // Single match: retrieve full exchange and optionally re-verify claims
-      const matchedTurn = matches[0];
-      const exchange = await historyRetriever.getFullExchange(matchedTurn.message.id);
-
-      if (exchange) {
-        const asksReverify = /\b(still\s+correct|accurate|changed|current|update|valid|prices?)\b/i.test(
-          userMessage
-        );
-
-        let reverifyBlock = "";
-        if (asksReverify) {
-          const report = await reVerifier.verify(
-            exchange.userMessage.conversationId,
-            reference.type !== "topic_only" ? reference.dateExpression : undefined,
-            reference.type !== "date_only" ? reference.topic : undefined,
-            dateResolver,
-            currentUserMessageId
-          );
-          if (report) {
-            reverifyBlock = `\n\n${reVerifier.formatReportForLLM(report)}`;
-          }
-        }
-
-        recalledHistoryPrompt = [
-          "### Recalled Historical Conversation",
-          `- **Date**: ${dateResolver.formatForDisplay(exchange.timestamp)}`,
-          `- **User Question**: "${exchange.userMessage.content}"`,
-          `- **Assistant Answer**: "${exchange.assistantResponse.content}"`,
-          reverifyBlock,
-          "",
-          "Ground your answer strictly in this recalled exchange. Restate the question and answer clearly. If re-verification details are provided, indicate whether the old facts remain accurate or have changed.",
-        ].join("\n");
-      }
+  // Handle re-verification if requested
+  if (memoryResult.isReverify && memoryResult.matches.length > 0) {
+    const matchedTurn = memoryResult.matches[0];
+    const report = await reVerifier.verify(
+      matchedTurn.message.conversationId,
+      undefined,
+      undefined,
+      dateResolver,
+      currentUserMessageId
+    );
+    if (report) {
+      recalledHistoryPrompt += `\n\n${reVerifier.formatReportForLLM(report)}`;
     }
   }
 
   const isReverify =
-    !!reference &&
-    (reference.type === "implicit_followup" ||
-      /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage));
+    !!memoryResult.isReverify ||
+    /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage);
   const questionType = answerBuilder.detectQuestionType(
     userMessage,
     !!anchorContext,
@@ -783,155 +708,81 @@ export async function runAgentStreaming(
 
   emitter.emitStatus("Analyzing question & context...");
 
-  // Check for past conversation recall or re-verification intent
-  const reference = ambiguityHandler.detectReference(userMessage, dateResolver);
-  let recalledHistoryPrompt = "";
+  // Unified semantic memory retrieval for cross-conversation recall and past context grounding
+  const memoryResult = await historyRetriever.retrieveContextForQuery({
+    userMessage,
+    conversationId,
+    currentUserMessageId,
+    dateResolver,
+  });
 
-  if (reference) {
-    if (reference.type === "implicit_followup") {
-      const lastAssistantTurn = rawHistory
-        .slice()
-        .reverse()
-        .find((m) => m.role === "assistant" && m.content);
+  if (memoryResult.ambiguousChoices && memoryResult.ambiguousChoices.length > 1) {
+    const disambiguationAnswer = ambiguityHandler.formatDisambiguation(memoryResult.ambiguousChoices);
 
-      if (lastAssistantTurn && lastAssistantTurn.content) {
-        emitter.emitStatus("Verifying claims from previous answer...");
-        const report = await reVerifier.verify(
-          conversationId || "",
-          undefined,
-          undefined,
-          dateResolver,
-          currentUserMessageId
-        );
-        if (report) {
-          recalledHistoryPrompt = reVerifier.formatReportForLLM(report);
-        }
-      }
-    } else {
-      let matches: HistoryMatch[] = [];
-      if (reference.type === "date_and_topic") {
-        matches = await historyRetriever.findByDateAndTopic(
-          conversationId || "",
-          reference.dateExpression,
-          reference.topic,
-          dateResolver,
-          currentUserMessageId
-        );
-      } else if (reference.type === "date_only") {
-        matches = await historyRetriever.findByDate(
-          conversationId || "",
-          reference.dateExpression,
-          dateResolver,
-          currentUserMessageId
-        );
-      } else if (reference.type === "topic_only") {
-        matches = await historyRetriever.findByTopic(
-          conversationId || "",
-          reference.topic,
-          currentUserMessageId
-        );
-      }
+    emitter.emitAnswerStart();
+    emitter.emitAnswerChunk(disambiguationAnswer);
+    emitter.emitAnswerEnd(disambiguationAnswer);
 
-      if (matches.length === 0) {
-        matches = await historyRetriever.findAcrossConversations(
-          reference.type !== "topic_only" ? reference.dateExpression : undefined,
-          reference.type !== "date_only" ? reference.topic : undefined,
-          dateResolver,
-          currentUserMessageId
-        );
-      }
+    let savedMessageId = `msg_${Date.now()}`;
+    if (shouldPersist && conversationId) {
+      const savedMsg = await messageService.addAssistantMessage(
+        conversationId,
+        disambiguationAnswer,
+        [],
+        activeModel
+      );
+      savedMessageId = savedMsg.id;
+    }
 
-      if (matches.length === 0) {
-        const targetDesc =
-          reference.type === "date_only"
-            ? reference.dateExpression
-            : reference.type === "topic_only"
-            ? reference.topic
-            : `${reference.dateExpression} regarding ${reference.topic}`;
+    emitter.emitDone(conversationId, savedMessageId);
+    return;
+  }
 
-        const notFoundAnswer = `I checked our conversation history, but I couldn't find any recorded questions or discussions matching "${targetDesc}".`;
+  // If user explicitly asked about past history/dates, but zero records exist:
+  if (memoryResult.isExplicitRecall && memoryResult.matches.length === 0) {
+    const notFoundAnswer =
+      "I checked our conversation history, but I couldn't find any recorded questions or discussions matching that. Could you remind me?";
 
-        emitter.emitAnswerStart();
-        emitter.emitAnswerChunk(notFoundAnswer);
-        emitter.emitAnswerEnd(notFoundAnswer);
+    emitter.emitAnswerStart();
+    emitter.emitAnswerChunk(notFoundAnswer);
+    emitter.emitAnswerEnd(notFoundAnswer);
 
-        let savedMessageId = `msg_${Date.now()}`;
-        if (shouldPersist && conversationId) {
-          const savedMsg = await messageService.addAssistantMessage(
-            conversationId,
-            notFoundAnswer,
-            [],
-            activeModel
-          );
-          savedMessageId = savedMsg.id;
-        }
+    let savedMessageId = `msg_${Date.now()}`;
+    if (shouldPersist && conversationId) {
+      const savedMsg = await messageService.addAssistantMessage(
+        conversationId,
+        notFoundAnswer,
+        [],
+        activeModel
+      );
+      savedMessageId = savedMsg.id;
+    }
 
-        emitter.emitDone(conversationId, savedMessageId);
-        return;
-      }
+    emitter.emitDone(conversationId, savedMessageId);
+    return;
+  }
 
-      if (matches.length > 1 && reference.type === "date_only") {
-        const disambiguationAnswer = ambiguityHandler.formatDisambiguation(matches);
+  let recalledHistoryPrompt = memoryResult.recalledHistoryPrompt;
 
-        emitter.emitAnswerStart();
-        emitter.emitAnswerChunk(disambiguationAnswer);
-        emitter.emitAnswerEnd(disambiguationAnswer);
-
-        let savedMessageId = `msg_${Date.now()}`;
-        if (shouldPersist && conversationId) {
-          const savedMsg = await messageService.addAssistantMessage(
-            conversationId,
-            disambiguationAnswer,
-            [],
-            activeModel
-          );
-          savedMessageId = savedMsg.id;
-        }
-
-        emitter.emitDone(conversationId, savedMessageId);
-        return;
-      }
-
-      const matchedTurn = matches[0];
-      const exchange = await historyRetriever.getFullExchange(matchedTurn.message.id);
-
-      if (exchange) {
-        const asksReverify = /\b(still\s+correct|accurate|changed|current|update|valid|prices?)\b/i.test(
-          userMessage
-        );
-
-        let reverifyBlock = "";
-        if (asksReverify) {
-          emitter.emitStatus("Re-verifying claims against current web sources...");
-          const report = await reVerifier.verify(
-            exchange.userMessage.conversationId,
-            reference.type !== "topic_only" ? reference.dateExpression : undefined,
-            reference.type !== "date_only" ? reference.topic : undefined,
-            dateResolver,
-            currentUserMessageId
-          );
-          if (report) {
-            reverifyBlock = `\n\n${reVerifier.formatReportForLLM(report)}`;
-          }
-        }
-
-        recalledHistoryPrompt = [
-          "### Recalled Historical Conversation",
-          `- **Date**: ${dateResolver.formatForDisplay(exchange.timestamp)}`,
-          `- **User Question**: "${exchange.userMessage.content}"`,
-          `- **Assistant Answer**: "${exchange.assistantResponse.content}"`,
-          reverifyBlock,
-          "",
-          "Ground your answer strictly in this recalled exchange. Restate the question and answer clearly. If re-verification details are provided, indicate whether the old facts remain accurate or have changed.",
-        ].join("\n");
-      }
+  // Handle re-verification if requested
+  if (memoryResult.isReverify && memoryResult.matches.length > 0) {
+    emitter.emitStatus("Re-verifying claims against current web sources...");
+    const matchedTurn = memoryResult.matches[0];
+    const report = await reVerifier.verify(
+      matchedTurn.message.conversationId,
+      undefined,
+      undefined,
+      dateResolver,
+      currentUserMessageId
+    );
+    if (report) {
+      recalledHistoryPrompt += `\n\n${reVerifier.formatReportForLLM(report)}`;
     }
   }
 
   const isReverify =
-    !!reference &&
-    (reference.type === "implicit_followup" ||
-      /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage));
+    memoryResult.isReverify ||
+    /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage);
   const questionType = answerBuilder.detectQuestionType(
     userMessage,
     !!anchorContext,

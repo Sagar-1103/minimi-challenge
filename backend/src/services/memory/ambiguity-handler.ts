@@ -9,6 +9,15 @@ export type ReferenceType =
   | null;
 
 export class AmbiguityHandler {
+  // Check if a message explicitly asks about or references past memory/conversations
+  isExplicitRecallQuery(message: string): boolean {
+    if (!message || typeof message !== "string") return false;
+    const text = message.trim();
+    return /\b(did I (?:mention|say|tell you|ask)|what did I (?:mention|say|tell you|ask)|where (?:did I say|was I planning)|what was I planning|what (?:were|are) my (?:preferences?|plans?)|where did I want to|remind me (?:what|about|of|where)|do you remember (?:what|where|who|when|if|that|my|our)|what cold weather|what destinations|what places did I|in (?:our|a|my) (?:previous|last|past) (?:chat|conversation|message))\b/i.test(
+      text
+    );
+  }
+
   // Identify if the user's message is a memory recall or re-verification query
   detectReference(message: string, dateResolver?: DateResolver): ReferenceType {
     if (!message || typeof message !== "string") return null;
@@ -44,7 +53,7 @@ export class AmbiguityHandler {
 
     // Check if the query is asking about previous conversations or re-verifying
     const hasRecallTrigger =
-      /\b(what did I ask|what was my question|what did we discuss|what did I say|remind me what|do you remember what|did I ask|last\s+[a-z]+\s+I\s+asked|on\s+.*\s+I\s+asked)\b/i.test(
+      /\b(what did I (?:ask|say|mention|tell you)|what was my (?:question|plan|preference|vacation|trip)|what did we discuss|what did I say|remind me (?:what|about|of|where)|do you remember (?:what|about|where|when|that)|did I (?:ask|mention|say|tell you)|what (?:destinations|places|topics) did I|last\s+[a-z]+\s+I\s+(?:asked|said|mentioned)|on\s+.*\s+I\s+(?:asked|said|mentioned))\b/i.test(
         text
       );
 
@@ -53,7 +62,7 @@ export class AmbiguityHandler {
         text
       );
 
-    // 1. Date and topic combined
+    // 1. Date and topic combined (requires an explicit topic or topic clause)
     if (dateExpression && extractedTopic && (hasRecallTrigger || hasReverifyTrigger || /\basked\b/i.test(text))) {
       return {
         type: "date_and_topic",
@@ -62,7 +71,7 @@ export class AmbiguityHandler {
       };
     }
 
-    // 2. Date only
+    // 2. Date only (date expression with recall intent, but no explicit topic)
     if (dateExpression && (hasRecallTrigger || hasReverifyTrigger || /^(?:what did I ask|what was asked)/i.test(text))) {
       return {
         type: "date_only",
@@ -71,10 +80,10 @@ export class AmbiguityHandler {
     }
 
     // 3. Topic only
-    if (!dateExpression && extractedTopic && hasRecallTrigger) {
+    if (!dateExpression && (extractedTopic || hasRecallTrigger)) {
       return {
         type: "topic_only",
-        topic: extractedTopic,
+        topic: extractedTopic || text,
       };
     }
 

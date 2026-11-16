@@ -6,6 +6,7 @@ import type {
   ToolCallRecord,
 } from "../../types/conversation.types";
 import { DateResolver } from "../date-resolver";
+import { ambiguityHandler } from "./ambiguity-handler";
 import { logger } from "../../utils/logger";
 
 export interface HistoryMatch {
@@ -14,6 +15,21 @@ export interface HistoryMatch {
   matchType: "exact_date" | "date_range" | "topic" | "combined";
   matchConfidence: number;
   conversationId?: string;
+}
+
+export interface MemoryRetrievalParams {
+  userMessage: string;
+  conversationId?: string;
+  currentUserMessageId?: string;
+  dateResolver: DateResolver;
+}
+
+export interface MemoryRetrievalResult {
+  matches: HistoryMatch[];
+  isExplicitRecall: boolean;
+  recalledHistoryPrompt: string;
+  ambiguousChoices?: HistoryMatch[];
+  isReverify?: boolean;
 }
 
 export interface Exchange {
@@ -474,6 +490,167 @@ export class HistoryRetriever {
     }
 
     return results;
+  }
+
+  // Unified semantic memory retrieval for cross-conversation recall and past context grounding
+  async retrieveContextForQuery(params: MemoryRetrievalParams): Promise<MemoryRetrievalResult> {
+    const { userMessage, conversationId, currentUserMessageId, dateResolver } = params;
+    const isExplicitRecall = ambiguityHandler.isExplicitRecallQuery(userMessage);
+    const reference = ambiguityHandler.detectReference(userMessage, dateResolver);
+
+    let matches: HistoryMatch[] = [];
+    let isReverify = false;
+
+    // Check if user is asking for re-verification ("is that still true", etc.)
+    if (
+      reference?.type === "implicit_followup" ||
+      /\b(still\s+correct|accurate|changed|current|update|valid)\b/i.test(userMessage)
+    ) {
+      isReverify = true;
+    }
+
+    // 1. Explicit date and topic reference
+    if (reference?.type === "date_and_topic") {
+      matches = await this.findByDateAndTopic(
+        conversationId || "",
+        reference.dateExpression,
+        reference.topic,
+        dateResolver,
+        currentUserMessageId
+      );
+      if (matches.length === 0) {
+        matches = await this.findAcrossConversations(
+          reference.dateExpression,
+          reference.topic,
+          dateResolver,
+          currentUserMessageId
+        );
+      }
+    } else if (reference?.type === "date_only") {
+      matches = await this.findByDate(
+        conversationId || "",
+        reference.dateExpression,
+        dateResolver,
+        currentUserMessageId
+      );
+      if (matches.length === 0) {
+        matches = await this.findAcrossConversations(
+          reference.dateExpression,
+          undefined,
+          dateResolver,
+          currentUserMessageId
+        );
+      }
+
+      // If multiple distinct queries were asked on that date, offer disambiguation
+      if (matches.length > 1) {
+        return {
+          matches,
+          isExplicitRecall: true,
+          recalledHistoryPrompt: "",
+          ambiguousChoices: matches,
+          isReverify,
+        };
+      }
+    } else {
+      // Check if user is asking a question or attempting to recall past discussions
+      const isQuestion = /\?|^(who|what|where|when|why|how|which|can|could|should|would|is|are|do|does|did|will)\b/i.test(
+        userMessage.trim()
+      );
+
+      // If user is just declaring a new preference/statement without asking a question or referencing past chats:
+      // Do NOT inject past unrelated memories!
+      if (!isExplicitRecall && !reference && !isQuestion) {
+        return {
+          matches: [],
+          isExplicitRecall: false,
+          recalledHistoryPrompt: "",
+          isReverify,
+        };
+      }
+
+      // If within current conversation, only search topic if explicit reference was made
+      // (the current conversation's regular history is already in priorHistory)
+      if (conversationId && reference?.type === "topic_only") {
+        matches = await this.findByTopic(conversationId, reference.topic, currentUserMessageId);
+        matches = matches.filter(
+          (m) =>
+            m.message.content &&
+            m.message.content.trim().toLowerCase() !== userMessage.trim().toLowerCase() &&
+            (!isExplicitRecall || !ambiguityHandler.isExplicitRecallQuery(m.message.content))
+        );
+      }
+
+      // If no match in current conversation or if searching across conversations:
+      if (matches.length === 0) {
+        // Use a strict threshold (0.65) for general questions to prevent unrelated topic bleed
+        const threshold = isExplicitRecall ? 0.48 : (env.VECTOR_SEARCH_THRESHOLD ?? 0.65);
+        const searchTopic = reference?.type === "topic_only" ? reference.topic : userMessage;
+        const raw = await this.findBySemanticSimilarity(searchTopic, {
+          excludeMessageId: currentUserMessageId,
+          threshold,
+          limit: 8,
+        });
+
+        // Filter out echoes of the recall question itself to isolate actual past statements/preferences
+        matches = raw.filter(
+          (m) =>
+            m.message.content &&
+            m.message.content.trim().toLowerCase() !== userMessage.trim().toLowerCase() &&
+            (!isExplicitRecall || !ambiguityHandler.isExplicitRecallQuery(m.message.content))
+        );
+      }
+    }
+
+    // 3. If no matches were found:
+    if (matches.length === 0) {
+      return {
+        matches: [],
+        isExplicitRecall,
+        recalledHistoryPrompt: "",
+        isReverify,
+      };
+    }
+
+    // 4. Hydrate top exchanges and build rich context block for LLM
+    const topMatches = matches.slice(0, 2);
+    const exchanges = await Promise.all(
+      topMatches.map((m) => this.getFullExchange(m.message.id))
+    );
+    const validExchanges = exchanges.filter((e): e is Exchange => !!e);
+
+    let promptBlock = "";
+    if (validExchanges.length > 0) {
+      const exchangeDescriptions = validExchanges
+        .map((ex, idx) => {
+          const dateStr = dateResolver.formatForDisplay(ex.timestamp);
+          return [
+            `[Past Discussion ${idx + 1} - ${dateStr}]`,
+            `- User previously stated/asked: "${ex.userMessage.content}"`,
+            `- Assistant previously responded: "${ex.assistantResponse.content ? ex.assistantResponse.content.slice(0, 350) : ""}"`,
+          ].join("\n");
+        })
+        .join("\n\n");
+
+      promptBlock = [
+        "### Recalled Background Context (from Vector Memory)",
+        "The following background exchange was retrieved from your conversation history with this user:",
+        exchangeDescriptions,
+        "",
+        "**Context Usage Directives:**",
+        "- Use the background context above ONLY if it is directly relevant to answering the user's current request.",
+        "- If the user's message is about a new or different topic, answer their prompt directly and DO NOT mention or bridge to unrelated past topics.",
+        "- NEVER use phrases like 'Quick tie-back to what we discussed', 'Noted for future reference', or 'I have saved this to memory'.",
+        "- If the user asks what they previously said or mentioned, summarize it clearly and conversationally.",
+      ].join("\n");
+    }
+
+    return {
+      matches,
+      isExplicitRecall,
+      recalledHistoryPrompt: promptBlock,
+      isReverify,
+    };
   }
 }
 
