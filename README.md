@@ -20,31 +20,6 @@ For in-depth architectural decisions, trade-offs, and design rationale, see **[`
 
 ![Mimi Architecture](./mimi-architecture.png)
 
-```mermaid
-flowchart TD
-    User["User Query"] --> Safety["Safety & Injection Filter"]
-    Safety --> Intent["Intent & Ambiguity Handler"]
-
-    Intent -->|"Temporal / Live Queries"| Resolver["DateResolver & Calendar Grounding"]
-    Resolver --> QueryBuilder["Date-Aware QueryBuilder"]
-    QueryBuilder --> Search["Parallel Search Executor"]
-    Search --> Scorer["Source Quality Evaluator"]
-
-    Intent -->|"Explicit / Semantic Recall"| Strategy{"Memory Strategy"}
-    Strategy -->|"Exact Date Mention"| TurnIndex["Chronological Turn Index"]
-    Strategy -->|"Semantic Concept"| VectorStore["pgvector Semantic Store"]
-    TurnIndex --> ClaimExtractor["Claim Extractor"]
-    VectorStore --> ClaimExtractor
-
-    Scorer --> ReVerifier["Factual Re-Verifier"]
-    ClaimExtractor --> ReVerifier
-
-    ReVerifier --> AnswerBuilder["AnswerBuilder"]
-    AnswerBuilder --> Tone["Tone & Persona Guardrail"]
-    Tone --> SSE["SSE Event Streamer"]
-    SSE --> Client["Client Real-Time Stream"]
-```
-
 ---
 
 
