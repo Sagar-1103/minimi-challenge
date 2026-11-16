@@ -8,7 +8,7 @@ I designed Mimi around a single principle: **keep the pipeline deterministic, th
 
 ---
 
-## 1. How the Pipeline Works
+## 1. How It Works
 
 Rather than letting an autonomous agent wander through unbounded tool loops, Mimi routes every user turn through a coordinated, predictable pipeline:
 
@@ -29,7 +29,7 @@ Human conversation requires two kinds of memory:
 When a user asks if a past answer is still true, the agent doesn't guess. It extracts verifiable metrics (prices, seat counts, storage limits) from the previous assistant response, searches current sources, and determines whether each fact is still correct, outdated, or unconfirmed. The response leads with a clear summary headline followed by a comparison table.
 
 ### Natural Conversational Tone
-Many memory-enabled assistants announce their internal mechanics (*"Noted for future reference"*, *"Connecting back to our previous chat"*). I put strict guardrails in the system prompt to eliminate this meta-talk: recalled facts must be woven naturally into the answer, just like human recall.
+Many memory-enabled assistants announce their internal mechanics (*"Noted for future reference"*, *"Connecting back to the previous chat"*). I put strict guardrails in the system prompt to eliminate this meta-talk: recalled facts must be woven naturally into the answer, just like human recall.
 
 ---
 
@@ -47,3 +47,12 @@ Many memory-enabled assistants announce their internal mechanics (*"Noted for fu
 - **Headless Browser Scraping (Playwright, Puppeteer)**: Navigating live browser DOMs takes 10 to 30 seconds per page and routinely gets stuck behind Cloudflare challenges. Tavily delivers clean, pre-parsed markdown snippets in roughly 400 milliseconds.
 - **Pure Full-Text Search (tsvector)**: Standard keyword search completely breaks when a user asks about *"thermal baths"* after previously discussing *"onsen"*. Dense vector embeddings provide the vocabulary invariance needed for real human conversations.
 - **Multi-Pass LLM Self-Critique**: Having the model review its own output in a second turn doubled latency with negligible improvement in quality. I achieved better results by giving clear formatting directives upfront (headline-first, markdown tables, direct citation links).
+
+---
+
+## 4. What I Would Do With Another Week
+
+- **Automated Memory Consolidation**: A scheduled background worker that periodically merges, deduplicates, and indexes long-term conversation memories to maintain fast vector retrieval and high precision as thread history grows.
+- **Hybrid Graph Memory**: Augmenting dense vector embeddings with a lightweight entity-relationship graph to support structured constraint filtering alongside semantic recall.
+- **Cross-Source Consensus Verification**: Cross-referencing evidence across multiple independent web domains to detect conflicting statements and score factual confidence based on publication freshness and source authority.
+- **User Preference Conflict Resolution**: When a user's stated requirements contradict earlier constraints, gracefully asking clarifying questions rather than silently overwriting past preferences.
