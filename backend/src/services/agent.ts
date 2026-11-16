@@ -135,7 +135,7 @@ export async function runAgent(
   // Load existing conversation or initialize a new one
   if (shouldPersist) {
     if (conversationId) {
-      const existingConv = await conversationService.getById(conversationId);
+      const existingConv = await conversationService.getById(conversationId, 25);
       if (!existingConv) {
         throw new NotFoundError(`Conversation with ID "${conversationId}" not found`);
       }
@@ -737,7 +737,7 @@ export async function runAgentStreaming(
 
   if (shouldPersist) {
     if (conversationId) {
-      const existingConv = await conversationService.getById(conversationId);
+      const existingConv = await conversationService.getById(conversationId, 25);
       if (!existingConv) {
         throw new NotFoundError(`Conversation with ID "${conversationId}" not found`);
       }

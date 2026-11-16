@@ -1,9 +1,12 @@
 import { prisma } from "../../lib/prisma";
+import { embeddingService } from "../embedding.service";
+import { env } from "../../config/env";
 import type {
   MessageWithToolCalls,
   ToolCallRecord,
 } from "../../types/conversation.types";
 import { DateResolver } from "../date-resolver";
+import { logger } from "../../utils/logger";
 
 export interface HistoryMatch {
   message: MessageWithToolCalls;
@@ -20,7 +23,184 @@ export interface Exchange {
   timestamp: Date;
 }
 
+export interface SemanticSearchOptions {
+  conversationId?: string;
+  startDate?: Date;
+  endDate?: Date;
+  excludeMessageId?: string;
+  threshold?: number;
+  limit?: number;
+  matchType?: "topic" | "combined";
+}
+
 export class HistoryRetriever {
+  // Core pgvector semantic search method with cosine similarity ranking
+  async findBySemanticSimilarity(
+    queryText: string,
+    options: SemanticSearchOptions = {}
+  ): Promise<HistoryMatch[]> {
+    const cleanQuery = queryText.trim();
+    if (!cleanQuery) return [];
+
+    const limit = options.limit ?? env.VECTOR_SEARCH_LIMIT ?? 5;
+    const threshold = options.threshold ?? env.VECTOR_SEARCH_THRESHOLD ?? 0.45;
+
+    try {
+      const queryVector = await embeddingService.getEmbedding(cleanQuery);
+      const isZeroVector = queryVector.every((v) => v === 0);
+
+      if (!isZeroVector) {
+        const vectorStr = `[${queryVector.join(",")}]`;
+
+        const rawRows = await prisma.$queryRawUnsafe<any[]>(
+          `
+          SELECT 
+            m.id, 
+            m."conversationId", 
+            m.role, 
+            m.content, 
+            m.timestamp,
+            (1 - (m.embedding <=> $1::vector)) AS similarity
+          FROM messages m
+          WHERE m.embedding IS NOT NULL
+            AND m.role = 'user'
+            AND ($2::text IS NULL OR m."conversationId" = $2)
+            AND ($3::timestamptz IS NULL OR m.timestamp >= $3)
+            AND ($4::timestamptz IS NULL OR m.timestamp <= $4)
+            AND ($5::text IS NULL OR m.id != $5)
+            AND (1 - (m.embedding <=> $1::vector)) >= $6
+          ORDER BY m.embedding <=> $1::vector ASC
+          LIMIT $7;
+          `,
+          vectorStr,
+          options.conversationId ?? null,
+          options.startDate ? options.startDate.toISOString() : null,
+          options.endDate ? options.endDate.toISOString() : null,
+          options.excludeMessageId ?? null,
+          threshold,
+          limit
+        );
+
+        if (rawRows.length > 0) {
+          logger.info(
+            `pgvector semantic search found ${rawRows.length} matches for "${cleanQuery}" (top similarity: ${(rawRows[0].similarity * 100).toFixed(1)}%)`
+          );
+          return this.hydrateMatches(rawRows, options.matchType || "topic");
+        }
+      }
+    } catch (err: any) {
+      logger.warn(`pgvector query failed, falling back to substring search: ${err.message}`);
+    }
+
+    // Fallback: substring search if vector search returns no matches or embedding failed
+    return this.fallbackSubstringSearch(cleanQuery, options);
+  }
+
+  // Fallback substring search to ensure legacy or non-embedded messages are still discoverable
+  private async fallbackSubstringSearch(
+    cleanTopic: string,
+    options: SemanticSearchOptions
+  ): Promise<HistoryMatch[]> {
+    const userMessages = await prisma.message.findMany({
+      where: {
+        conversationId: options.conversationId,
+        role: "user",
+        id: options.excludeMessageId ? { not: options.excludeMessageId } : undefined,
+        timestamp: {
+          gte: options.startDate,
+          lte: options.endDate,
+        },
+        content: {
+          contains: cleanTopic,
+          mode: "insensitive",
+        },
+      },
+      orderBy: { timestamp: "desc" },
+      take: options.limit ?? 5,
+      include: {
+        toolCalls: {
+          orderBy: { createdAt: "asc" },
+        },
+      },
+    });
+
+    const matches: HistoryMatch[] = [];
+    for (const userMsg of userMessages) {
+      const assistantResponse = await prisma.message.findFirst({
+        where: {
+          conversationId: userMsg.conversationId,
+          role: "assistant",
+          timestamp: {
+            gte: userMsg.timestamp,
+          },
+        },
+        orderBy: { timestamp: "asc" },
+        include: {
+          toolCalls: {
+            orderBy: { createdAt: "asc" },
+          },
+        },
+      });
+
+      matches.push({
+        message: userMsg,
+        assistantResponse,
+        matchType: options.matchType || "topic",
+        matchConfidence: 0.75,
+        conversationId: userMsg.conversationId,
+      });
+    }
+
+    return matches;
+  }
+
+  // Hydrate raw SQL rows into full HistoryMatch objects with assistant responses and tool calls
+  private async hydrateMatches(
+    rows: any[],
+    defaultMatchType: "topic" | "combined"
+  ): Promise<HistoryMatch[]> {
+    const matches: HistoryMatch[] = [];
+
+    for (const row of rows) {
+      const userMessage = await prisma.message.findUnique({
+        where: { id: row.id },
+        include: {
+          toolCalls: {
+            orderBy: { createdAt: "asc" },
+          },
+        },
+      });
+
+      if (!userMessage) continue;
+
+      const assistantResponse = await prisma.message.findFirst({
+        where: {
+          conversationId: userMessage.conversationId,
+          role: "assistant",
+          timestamp: {
+            gte: userMessage.timestamp,
+          },
+        },
+        orderBy: { timestamp: "asc" },
+        include: {
+          toolCalls: {
+            orderBy: { createdAt: "asc" },
+          },
+        },
+      });
+
+      matches.push({
+        message: userMessage,
+        assistantResponse,
+        matchType: defaultMatchType,
+        matchConfidence: Number(row.similarity) || 0.85,
+        conversationId: userMessage.conversationId,
+      });
+    }
+
+    return matches;
+  }
+
   // Query messages matching a date expression within a specific conversation
   async findByDate(
     conversationId: string,
@@ -87,65 +267,21 @@ export class HistoryRetriever {
     return matches;
   }
 
-  // Find messages containing specific topic keywords
+  // Find messages containing specific topic via semantic similarity
   async findByTopic(
     conversationId: string,
     topic: string,
     excludeMessageId?: string
   ): Promise<HistoryMatch[]> {
-    const cleanTopic = topic.trim();
-    if (!cleanTopic) return [];
-
-    const userMessages = await prisma.message.findMany({
-      where: {
-        conversationId,
-        role: "user",
-        id: excludeMessageId ? { not: excludeMessageId } : undefined,
-        content: {
-          contains: cleanTopic,
-          mode: "insensitive",
-        },
-      },
-      orderBy: { timestamp: "asc" },
-      include: {
-        toolCalls: {
-          orderBy: { createdAt: "asc" },
-        },
-      },
+    return this.findBySemanticSimilarity(topic, {
+      conversationId,
+      excludeMessageId,
+      matchType: "topic",
+      limit: 5,
     });
-
-    const matches: HistoryMatch[] = [];
-
-    for (const userMsg of userMessages) {
-      const assistantResponse = await prisma.message.findFirst({
-        where: {
-          conversationId,
-          role: "assistant",
-          timestamp: {
-            gte: userMsg.timestamp,
-          },
-        },
-        orderBy: { timestamp: "asc" },
-        include: {
-          toolCalls: {
-            orderBy: { createdAt: "asc" },
-          },
-        },
-      });
-
-      matches.push({
-        message: userMsg,
-        assistantResponse,
-        matchType: "topic",
-        matchConfidence: 0.8,
-        conversationId,
-      });
-    }
-
-    return matches;
   }
 
-  // Find messages matching both a date constraint and topic keyword
+  // Find messages matching both a date constraint and topic via semantic similarity
   async findByDateAndTopic(
     conversationId: string,
     dateExpression: string,
@@ -165,57 +301,14 @@ export class HistoryRetriever {
     const startOfDay = new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
     const endOfDay = new Date(Date.UTC(year, month, day, 23, 59, 59, 999));
 
-    const userMessages = await prisma.message.findMany({
-      where: {
-        conversationId,
-        role: "user",
-        id: excludeMessageId ? { not: excludeMessageId } : undefined,
-        timestamp: {
-          gte: startOfDay,
-          lte: endOfDay,
-        },
-        content: {
-          contains: topic.trim(),
-          mode: "insensitive",
-        },
-      },
-      orderBy: { timestamp: "asc" },
-      include: {
-        toolCalls: {
-          orderBy: { createdAt: "asc" },
-        },
-      },
+    return this.findBySemanticSimilarity(topic, {
+      conversationId,
+      startDate: startOfDay,
+      endDate: endOfDay,
+      excludeMessageId,
+      matchType: "combined",
+      limit: 5,
     });
-
-    const matches: HistoryMatch[] = [];
-
-    for (const userMsg of userMessages) {
-      const assistantResponse = await prisma.message.findFirst({
-        where: {
-          conversationId,
-          role: "assistant",
-          timestamp: {
-            gte: userMsg.timestamp,
-          },
-        },
-        orderBy: { timestamp: "asc" },
-        include: {
-          toolCalls: {
-            orderBy: { createdAt: "asc" },
-          },
-        },
-      });
-
-      matches.push({
-        message: userMsg,
-        assistantResponse,
-        matchType: "combined",
-        matchConfidence: 0.95,
-        conversationId,
-      });
-    }
-
-    return matches;
   }
 
   // Load the complete round-trip exchange (question, answer, and executed tool calls)
@@ -298,7 +391,7 @@ export class HistoryRetriever {
     return null;
   }
 
-  // Search across all conversations when a referenced turn is not in the current session
+  // Search across all conversations via pgvector semantic similarity
   async findAcrossConversations(
     dateExpression?: string,
     topic?: string,
@@ -307,7 +400,6 @@ export class HistoryRetriever {
   ): Promise<Array<HistoryMatch & { conversationId: string }>> {
     let startOfDay: Date | undefined;
     let endOfDay: Date | undefined;
-    let resolutionConfidence = 0.8;
 
     if (dateExpression && dateResolver) {
       const resolution = dateResolver.resolve(dateExpression);
@@ -317,34 +409,34 @@ export class HistoryRetriever {
         const day = resolution.resolvedDate.getUTCDate();
         startOfDay = new Date(Date.UTC(year, month, day, 0, 0, 0, 0));
         endOfDay = new Date(Date.UTC(year, month, day, 23, 59, 59, 999));
-        resolutionConfidence = resolution.confidence === "exact" ? 0.95 : 0.85;
       }
     }
 
-    const whereClause: any = {
-      role: "user",
-    };
-
-    if (excludeMessageId) {
-      whereClause.id = { not: excludeMessageId };
-    }
-
-    if (startOfDay && endOfDay) {
-      whereClause.timestamp = {
-        gte: startOfDay,
-        lte: endOfDay,
-      };
-    }
-
     if (topic && topic.trim()) {
-      whereClause.content = {
-        contains: topic.trim(),
-        mode: "insensitive",
-      };
+      const matches = await this.findBySemanticSimilarity(topic, {
+        startDate: startOfDay,
+        endDate: endOfDay,
+        excludeMessageId,
+        limit: 10,
+        matchType: startOfDay ? "combined" : "topic",
+      });
+
+      return matches.map((m) => ({
+        ...m,
+        conversationId: m.conversationId || m.message.conversationId,
+      }));
     }
 
+    // If only date expression without topic, query by date bounds across conversations
     const userMessages = await prisma.message.findMany({
-      where: whereClause,
+      where: {
+        role: "user",
+        id: excludeMessageId ? { not: excludeMessageId } : undefined,
+        timestamp: {
+          gte: startOfDay,
+          lte: endOfDay,
+        },
+      },
       orderBy: { timestamp: "desc" },
       take: 10,
       include: {
@@ -355,7 +447,6 @@ export class HistoryRetriever {
     });
 
     const results: Array<HistoryMatch & { conversationId: string }> = [];
-
     for (const userMsg of userMessages) {
       const assistantResponse = await prisma.message.findFirst({
         where: {
@@ -373,18 +464,11 @@ export class HistoryRetriever {
         },
       });
 
-      const matchType =
-        startOfDay && topic
-          ? "combined"
-          : startOfDay
-          ? "exact_date"
-          : "topic";
-
       results.push({
         message: userMsg,
         assistantResponse,
-        matchType,
-        matchConfidence: resolutionConfidence,
+        matchType: "exact_date",
+        matchConfidence: 0.9,
         conversationId: userMsg.conversationId,
       });
     }

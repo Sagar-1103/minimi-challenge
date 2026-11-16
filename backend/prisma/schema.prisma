@@ -29,6 +29,7 @@ model Message {
   model          String?
   tokenCount     Int?
   createdAt      DateTime         @default(now())
+  embedding      Unsupported("vector(768)")?
 
   @@index([conversationId, timestamp])
   @@index([conversationId, role])

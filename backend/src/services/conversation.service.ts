@@ -26,20 +26,46 @@ export class ConversationService {
     });
   }
 
-  async getById(id: string): Promise<ConversationWithMessages | null> {
-    return prisma.conversation.findUnique({
-      where: { id },
-      include: {
-        messages: {
-          orderBy: { timestamp: "asc" },
-          include: {
-            toolCalls: {
-              orderBy: { createdAt: "asc" },
+  async getById(
+    id: string,
+    messageLimit?: number
+  ): Promise<ConversationWithMessages | null> {
+    if (!messageLimit) {
+      return prisma.conversation.findUnique({
+        where: { id },
+        include: {
+          messages: {
+            orderBy: { timestamp: "asc" },
+            include: {
+              toolCalls: {
+                orderBy: { createdAt: "asc" },
+              },
             },
           },
         },
+      });
+    }
+
+    const conv = await prisma.conversation.findUnique({
+      where: { id },
+    });
+    if (!conv) return null;
+
+    const messages = await prisma.message.findMany({
+      where: { conversationId: id },
+      orderBy: { timestamp: "desc" },
+      take: messageLimit,
+      include: {
+        toolCalls: {
+          orderBy: { createdAt: "asc" },
+        },
       },
     });
+
+    return {
+      ...conv,
+      messages: messages.reverse(),
+    };
   }
 
   async list(page = 1, limit = 20): Promise<PaginatedConversations> {

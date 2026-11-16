@@ -17,6 +17,28 @@ export const envSchema = z
     OPENROUTER_MODEL: z.string().default("deepseek/deepseek-chat"),
     OPENROUTER_BASE_URL: z.string().default("https://openrouter.ai/api/v1"),
     TAVILY_API_KEY: z.string().min(1, "TAVILY_API_KEY is required"),
+    EMBEDDING_PROVIDER: z.string().default("gemini"),
+    EMBEDDING_MODEL: z.string().default("gemini-embedding-2"),
+    EMBEDDING_API_KEY: z.string().optional().default(""),
+    EMBEDDING_BASE_URL: z.string().default("https://generativelanguage.googleapis.com/v1beta"),
+    EMBEDDING_DIMENSIONS: z
+      .string()
+      .default("768")
+      .transform((val) => Number(val))
+      .refine((val) => !isNaN(val) && val > 0, "EMBEDDING_DIMENSIONS must be a positive number"),
+    VECTOR_SEARCH_THRESHOLD: z
+      .string()
+      .default("0.45")
+      .transform((val) => Number(val))
+      .refine(
+        (val) => !isNaN(val) && val >= 0 && val <= 1,
+        "VECTOR_SEARCH_THRESHOLD must be between 0 and 1"
+      ),
+    VECTOR_SEARCH_LIMIT: z
+      .string()
+      .default("5")
+      .transform((val) => Number(val))
+      .refine((val) => !isNaN(val) && val > 0, "VECTOR_SEARCH_LIMIT must be a positive number"),
   })
   .superRefine((data, ctx) => {
     if (data.LLM_PROVIDER === "deepseek" && (!data.DEEPSEEK_API_KEY || data.DEEPSEEK_API_KEY.trim() === "")) {

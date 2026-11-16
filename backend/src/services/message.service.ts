@@ -1,4 +1,6 @@
 import { prisma } from "../lib/prisma";
+import { embeddingService } from "./embedding.service";
+import { logger } from "../utils/logger";
 import type {
   Message,
   MessageWithToolCalls,
@@ -6,6 +8,27 @@ import type {
 } from "../types/conversation.types";
 
 export class MessageService {
+  // Asynchronously generate and attach pgvector embedding to a message
+  public embedMessageBackground(messageId: string, content: string): void {
+    if (!content || !content.trim()) return;
+
+    // Fire-and-forget: does not block message creation or streaming
+    embeddingService
+      .getEmbedding(content)
+      .then(async (vector) => {
+        if (!vector || vector.length === 0 || vector.every((v) => v === 0)) return;
+        const vectorStr = `[${vector.join(",")}]`;
+        await prisma.$executeRawUnsafe(
+          `UPDATE messages SET embedding = $1::vector WHERE id = $2;`,
+          vectorStr,
+          messageId
+        );
+      })
+      .catch((err) => {
+        logger.warn(`Background message embedding failed for ${messageId}: ${err.message}`);
+      });
+  }
+
   async addUserMessage(
     conversationId: string,
     content: string,
@@ -24,6 +47,9 @@ export class MessageService {
       where: { id: conversationId },
       data: { updatedAt: new Date() },
     });
+
+    // Generate pgvector embedding in background
+    this.embedMessageBackground(msg.id, content);
 
     return msg;
   }
@@ -64,6 +90,9 @@ export class MessageService {
       where: { id: conversationId },
       data: { updatedAt: new Date() },
     });
+
+    // Generate pgvector embedding in background
+    this.embedMessageBackground(created.id, content);
 
     return created;
   }
